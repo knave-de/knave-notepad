@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Notes
+Comment=Write notes and find them again
+Exec=knave-notepad
+Icon=accessories-text-editor
+Terminal=false
+Categories=Utility;TextEditor;
+Keywords=notepad;text;editor;
+StartupNotify=true
+StartupWMClass=knave-notepad
