@@ -7,7 +7,7 @@ use crate::{
     vim::VimEditor,
 };
 use crossterm::event::{KeyCode, KeyModifiers as ModalModifiers};
-use knave_ui::{Color, DisplayList, Rect, TextAlign, toolkit::*};
+use knave_ui::{DisplayList, Rect, TextAlign, toolkit::*};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
 use winit::keyboard::{Key as NativeKey, ModifiersState, NamedKey};
 
@@ -71,6 +71,9 @@ pub struct Notes {
     command_open: bool,
     command: String,
     search_backwards: bool,
+    pending_delete: Option<String>,
+    rename_note: Option<String>,
+    rename_text: String,
 }
 trait Enabled {
     fn enabled(self, value: bool) -> Self;
@@ -103,6 +106,7 @@ fn row(id: u64, children: Vec<Element>) -> Element {
     let mut e = Element::new(id, Widget::Panel)
         .layout(Layout {
             flow: Flow::Row,
+            align: Align::Center,
             gap: 6.0,
             ..Default::default()
         })
@@ -134,6 +138,38 @@ fn toggle(id: u64, value: &str, checked: bool) -> Element {
     )
     .layout(Layout {
         height: Length::Px(36.0),
+        ..Default::default()
+    })
+}
+fn heading(id: u64, text: &str) -> Element {
+    Element::heading(id, text, knave_ui::HeadingLevel::H2)
+}
+fn stepper(
+    id: u64,
+    title: &str,
+    value: String,
+    minus: u64,
+    plus: u64,
+    can_minus: bool,
+    can_plus: bool,
+) -> Element {
+    let mut number = label(id + 8000, value);
+    number.layout.width = Length::Px(56.0);
+    number.style.text.align = TextAlign::Center;
+    row(
+        id,
+        vec![
+            label(id + 8100, title),
+            compact(minus, "−").enabled(can_minus),
+            number,
+            compact(plus, "+").enabled(can_plus),
+        ],
+    )
+    .layout(Layout {
+        flow: Flow::Row,
+        align: Align::Center,
+        height: Length::Px(44.0),
+        gap: 8.0,
         ..Default::default()
     })
 }
@@ -176,7 +212,11 @@ impl Notes {
             command_open: false,
             command: String::new(),
             search_backwards: false,
+            pending_delete: None,
+            rename_note: None,
+            rename_text: String::new(),
         };
+        app.save();
         app.rebuild()?;
         Ok(app)
     }
@@ -222,7 +262,9 @@ impl Notes {
             };
             format!(
                 "{}    UTF-8 · LF    {indent}: {}    Ln {}, Col {}{selected}    {mode}",
-                if self.save_error.is_none() {
+                if doc.text.is_empty() {
+                    "Empty note"
+                } else if self.save_error.is_none() {
                     "Saved"
                 } else {
                     "Unsaved"
@@ -280,9 +322,7 @@ impl Notes {
         self.focus_editor()
     }
     fn create(&mut self) -> AppResult {
-        let mut note = Note::new();
-        let number = self.book.notes.len() + 1;
-        note.name = Some(format!("Untitled Document {number}"));
+        let note = Note::new();
         let id = note.id.clone();
         self.book.notes.push(note);
         self.open(id)
@@ -315,14 +355,6 @@ impl Notes {
             && note.text != tab.doc.text
         {
             note.text = tab.doc.text.clone();
-            if note
-                .name
-                .as_ref()
-                .is_some_and(|name| name.starts_with("Untitled Document "))
-                && !note.text.trim().is_empty()
-            {
-                note.name = None;
-            }
             note.updated = now();
             changed = true;
         }
@@ -419,7 +451,10 @@ impl Notes {
         let Some(id) = &self.active else {
             return Ok(());
         };
-        let Some(note) = self.book.notes.iter().find(|n| &n.id == id) else {
+        self.export_note(&id.clone())
+    }
+    fn export_note(&mut self, id: &str) -> AppResult {
+        let Some(note) = self.book.notes.iter().find(|n| n.id == id) else {
             return Ok(());
         };
         let Some(path) = rfd::FileDialog::new()
@@ -434,6 +469,30 @@ impl Notes {
             Err(e) => self.message = Some(format!("Export failed: {e}")),
         };
         self.refresh_status()
+    }
+    fn finish_rename(&mut self) -> AppResult {
+        let name = self.rename_text.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        if let Some(id) = self.rename_note.take() {
+            if let Some(note) = self.book.notes.iter_mut().find(|n| n.id == id) {
+                note.name = Some(name.to_string());
+                note.updated = now();
+            }
+            self.save();
+        }
+        self.rebuild()
+    }
+    fn delete_note(&mut self, id: &str) -> AppResult {
+        self.book.notes.retain(|note| note.id != id);
+        self.book.tabs.retain(|tab| tab != id);
+        self.tabs.remove(id);
+        if self.active.as_deref() == Some(id) {
+            self.active = None;
+        }
+        self.save();
+        self.rebuild()
     }
     fn command(&mut self) -> AppResult {
         let command = self.command.trim().trim_start_matches(':').to_owned();
@@ -510,13 +569,35 @@ impl Notes {
         Ok(())
     }
     fn rebuild(&mut self) -> AppResult {
+        // Keep the active blank buffer editable (including undo), but discard
+        // empty drafts as soon as the user leaves them.
+        let keep = if self.page == Page::Editor {
+            self.active.as_deref()
+        } else {
+            None
+        };
+        self.book
+            .notes
+            .retain(|note| !note.text.is_empty() || Some(note.id.as_str()) == keep);
+        self.book
+            .tabs
+            .retain(|id| self.book.notes.iter().any(|note| &note.id == id));
+        self.tabs
+            .retain(|id, _| self.book.notes.iter().any(|note| &note.id == id));
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|id| !self.book.notes.iter().any(|note| &note.id == id))
+        {
+            self.active = None;
+        }
         let editing = self.page == Page::Editor;
-        let heading = if self.page == Page::Settings {
+        let page_title = if self.page == Page::Settings {
             "Preferences"
         } else {
             "Notes"
         };
-        let mut title = label(3, heading);
+        let mut title = label(3, page_title);
         title.style.text.align = TextAlign::Center;
         title.style.text.weight = 600;
         title.style.text.wrap = knave_ui::TextWrap::None;
@@ -625,7 +706,7 @@ impl Notes {
                 row(
                     31,
                     vec![
-                        label(32, "All documents"),
+                        heading(32, "All documents"),
                         {
                             let mut e = label(33, "Search");
                             e.layout.width = Length::Px(48.0);
@@ -636,11 +717,60 @@ impl Notes {
                 )
                 .layout(Layout {
                     flow: Flow::Row,
-                    height: Length::Px(52.0),
-                    padding: 10.0,
+                    height: Length::Px(72.0),
+                    align: Align::Center,
+                    padding: 20.0,
                     ..Default::default()
                 }),
             );
+            if let Some(id) = &self.pending_delete {
+                let title = self
+                    .book
+                    .notes
+                    .iter()
+                    .find(|note| &note.id == id)
+                    .map(Note::title)
+                    .unwrap_or_default();
+                body.push(
+                    row(
+                        89,
+                        vec![
+                            label(90, format!("Delete “{title}”? This cannot be undone.")),
+                            button(91, "Delete"),
+                            button(92, "Cancel"),
+                        ],
+                    )
+                    .layout(Layout {
+                        flow: Flow::Row,
+                        align: Align::Center,
+                        height: Length::Px(64.0),
+                        padding: 12.0,
+                        gap: 8.0,
+                        ..Default::default()
+                    }),
+                );
+            }
+            if self.rename_note.is_some() {
+                body.push(
+                    row(
+                        84,
+                        vec![
+                            label(85, "Name"),
+                            field(86, &self.rename_text)?,
+                            button(87, "Save"),
+                            button(88, "Cancel"),
+                        ],
+                    )
+                    .layout(Layout {
+                        flow: Flow::Row,
+                        align: Align::Center,
+                        height: Length::Px(52.0),
+                        padding: 10.0,
+                        gap: 8.0,
+                        ..Default::default()
+                    }),
+                );
+            }
             let query = self.query.to_lowercase();
             let mut notes: Vec<_> = self
                 .book
@@ -662,22 +792,86 @@ impl Notes {
                 .enumerate()
                 .skip(self.overview_page * PAGE_SIZE)
                 .take(PAGE_SIZE)
-                .map(|(index, _)| {
-                    let mut e = button(1000 + (index % PAGE_SIZE) as u64, "")
-                        .class("document")
-                        .layout(Layout {
-                            width: Length::Fill,
-                            height: Length::Px(244.0),
-                            ..Default::default()
-                        });
-                    e.paint_surface = false;
-                    e
+                .map(|(index, note)| {
+                    let slot = (index % PAGE_SIZE) as u64;
+                    let mut cover =
+                        button(1000 + slot, "")
+                            .class("document-cover")
+                            .layout(Layout {
+                                width: Length::Fill,
+                                height: Length::Px(166.0),
+                                padding: 16.0,
+                                align: Align::Center,
+                                ..Default::default()
+                            });
+                    let excerpt = note
+                        .text
+                        .lines()
+                        .take(12)
+                        .map(|line| {
+                            line.chars()
+                                .take(100)
+                                .collect::<String>()
+                                .replace('\t', "    ")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut preview = label(10000 + slot, excerpt).class("document-preview");
+                    preview.layout = Layout {
+                        width: Length::Fill,
+                        height: Length::Fill,
+                        padding: 1.0,
+                        ..Default::default()
+                    };
+                    preview.style.text.align = TextAlign::Start;
+                    preview.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
+                    cover.children = vec![preview];
+                    let mut title = label(6000 + slot, note.title()).class("document-title");
+                    title.layout.height = Length::Px(42.0);
+                    title.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
+                    let menu = Element::new(
+                        2000 + slot,
+                        Widget::Menu {
+                            label: "⋯".into(),
+                            items: vec![
+                                MenuItem::option(1, "Rename…"),
+                                MenuItem::option(2, "Export…"),
+                                MenuItem::Separator,
+                                MenuItem::option(3, "Delete…"),
+                            ],
+                        },
+                    )
+                    .class("document-menu")
+                    .layout(Layout {
+                        width: Length::Px(32.0),
+                        height: Length::Px(30.0),
+                        ..Default::default()
+                    });
+                    panel(
+                        5000 + slot,
+                        vec![
+                            cover,
+                            row(7000 + slot, vec![title, menu]).layout(Layout {
+                                flow: Flow::Row,
+                                align: Align::Start,
+                                gap: 4.0,
+                                height: Length::Px(46.0),
+                                ..Default::default()
+                            }),
+                        ],
+                    )
+                    .layout(Layout {
+                        width: Length::Fill,
+                        height: Length::Px(224.0),
+                        gap: 12.0,
+                        ..Default::default()
+                    })
                 })
                 .collect::<Vec<_>>();
             let grid = panel(35, cards).layout(Layout {
                 flow: Flow::Grid { columns: cols },
-                padding: 16.0,
-                gap: 12.0,
+                padding: 20.0,
+                gap: 24.0,
                 ..Default::default()
             });
             body.push(
@@ -711,28 +905,28 @@ impl Notes {
             }
         } else {
             let settings = vec![
-                label(40, "Editor"),
-                row(
+                heading(40, "Editor"),
+                stepper(
                     41,
-                    vec![
-                        label(45, "Font size"),
-                        compact(46, "−").enabled(self.settings.font_size > 10),
-                        label(47, format!("{} px", self.settings.font_size)),
-                        compact(48, "+").enabled(self.settings.font_size < 40),
-                    ],
+                    "Font size",
+                    format!("{} px", self.settings.font_size),
+                    46,
+                    48,
+                    self.settings.font_size > 10,
+                    self.settings.font_size < 40,
                 ),
-                toggle(42, "Vim motions (modalkit)", self.settings.vim),
+                toggle(42, "Vim motions", self.settings.vim),
                 toggle(43, "Show line numbers", self.settings.line_numbers),
                 toggle(44, "Relative line numbers", self.settings.relative_numbers),
                 toggle(49, "Insert spaces instead of tabs", self.settings.spaces),
-                row(
+                stepper(
                     50,
-                    vec![
-                        label(51, "Tab width"),
-                        compact(52, "−").enabled(self.settings.tab_width > 1),
-                        label(53, self.settings.tab_width.to_string()),
-                        compact(54, "+").enabled(self.settings.tab_width < 16),
-                    ],
+                    "Tab width",
+                    self.settings.tab_width.to_string(),
+                    52,
+                    54,
+                    self.settings.tab_width > 1,
+                    self.settings.tab_width < 16,
                 ),
                 toggle(55, "Automatic indentation", self.settings.auto_indent),
                 toggle(56, "Highlight current line", self.settings.highlight_line),
@@ -743,9 +937,9 @@ impl Notes {
                 ),
             ];
             let settings = panel(59, settings).layout(Layout {
-                width: Length::Px(640.0),
+                width: Length::Fill,
                 padding: 24.0,
-                gap: 12.0,
+                gap: 8.0,
                 ..Default::default()
             });
             body.push(
@@ -770,6 +964,16 @@ impl Notes {
             gap: 4.0,
             ..Default::default()
         }));
+        // Resolve extra editor roles through theme tokens without overriding widgets.
+        for (id, class) in [
+            (90001, "note-surface"),
+            (90002, "note-selection"),
+            (90003, "note-accent"),
+        ] {
+            let mut probe = label(id, "").class(class);
+            probe.visible = false;
+            body.push(probe);
+        }
         let mut root = panel(0, body).layout(Layout {
             height: Length::Fill,
             gap: 0.0,
@@ -777,14 +981,15 @@ impl Notes {
         });
         root.paint_surface = true;
         self.scene.replace(root)?;
-        self.scene.set_stylesheet(":root { background-color: #1c1d26; color: #dee1e9; } button { background-color: #2b2c32; border-radius: 3px; color: #dee1e9; } button:hover { background-color: #3b3d48; } .header { background-color: #24252b; } .status { background-color: #232530; } text-input { background-color: #181a22; text-align: left; }")?;
+        self.scene.set_stylesheet(":root { color: var(--text); } .note-surface { color: var(--surface-hover); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 600; } .document-cover:hover { background-color: var(--surface-hover); border-color: var(--border-strong); color: var(--text); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 9px; line-height: 12px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--text); } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 600; } .document-menu { background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } text-input { text-align: left; }")?;
         Ok(())
     }
     fn paint_tabs(&mut self, list: &mut DisplayList) {
+        let palette = paint::Palette::from_scene(&self.scene);
         let Some(area) = self.scene.bounds(STRIP) else {
             return;
         };
-        paint::rect(list, area, Color::rgba(35, 36, 41, 255), area);
+        paint::rect(list, area, palette.bg, area);
         let width = (area.width / self.book.tabs.len().max(1) as f32).max(155.0);
         let total = width * self.book.tabs.len() as f32;
         if self.reveal_tab
@@ -824,24 +1029,20 @@ impl Notes {
             paint::rect(
                 list,
                 r,
-                if active {
-                    Color::rgba(46, 48, 56, 255)
-                } else {
-                    Color::rgba(37, 38, 43, 255)
-                },
+                if active { palette.surface } else { palette.bg },
                 area,
             );
             paint::rect(
                 list,
                 Rect::new(r.x + r.width - 1.0, r.y, 1.0, r.height),
-                Color::rgba(28, 29, 34, 255),
+                palette.surface,
                 area,
             );
             if active {
                 paint::rect(
                     list,
                     Rect::new(r.x, r.y + r.height - 3.0, r.width, 3.0),
-                    paint::ACCENT,
+                    palette.accent,
                     area,
                 );
             }
@@ -864,7 +1065,7 @@ impl Notes {
             } else {
                 title
             };
-            let mut style = paint::style(13.0, false, paint::FG);
+            let mut style = paint::style(13.0, false, palette.fg);
             style.align = TextAlign::Center;
             paint::text(
                 list,
@@ -877,84 +1078,8 @@ impl Notes {
                 list,
                 Rect::new(close.x + 7.0, close.y + 3.0, 16.0, 20.0),
                 "×",
-                paint::style(15.0, false, paint::MUTED),
+                paint::style(15.0, false, palette.muted),
                 area,
-            );
-        }
-    }
-    fn paint_library(&self, list: &mut DisplayList) {
-        let Some(view) = self.scene.bounds(ElementId(34)) else {
-            return;
-        };
-        for (slot, id) in self
-            .results
-            .iter()
-            .skip(self.overview_page * PAGE_SIZE)
-            .take(PAGE_SIZE)
-            .enumerate()
-        {
-            let Some(bounds) = self.scene.bounds(ElementId(1000 + slot as u64)) else {
-                continue;
-            };
-            let Some(clip) = bounds.intersection(view) else {
-                continue;
-            };
-            let Some(note) = self.book.notes.iter().find(|n| &n.id == id) else {
-                continue;
-            };
-            let w = 116.0;
-            let h = 158.0;
-            let page = Rect::new(bounds.x + (bounds.width - w) / 2.0, bounds.y + 8.0, w, h);
-            if self.scene.focus() == Some(ElementId(1000 + slot as u64)) {
-                paint::rect(
-                    list,
-                    Rect::new(page.x - 3.0, page.y - 3.0, w + 6.0, h + 6.0),
-                    paint::ACCENT,
-                    clip,
-                );
-            }
-            paint::rect(
-                list,
-                Rect::new(page.x + 3.0, page.y + 4.0, w, h),
-                Color::rgba(13, 14, 21, 255),
-                clip,
-            );
-            paint::rect(list, page, Color::rgba(238, 238, 232, 255), clip);
-            let inner = Rect::new(page.x + 10.0, page.y + 12.0, w - 20.0, h - 22.0);
-            let pageclip = inner.intersection(clip).unwrap_or_default();
-            for (index, line) in note.text.lines().take(17).enumerate() {
-                let value = line
-                    .replace('\t', "    ")
-                    .chars()
-                    .take(30)
-                    .collect::<String>();
-                paint::text(
-                    list,
-                    Rect::new(inner.x, inner.y + index as f32 * 7.5, inner.width, 8.0),
-                    value,
-                    paint::style(4.8, true, Color::rgba(61, 65, 73, 255)),
-                    pageclip,
-                );
-            }
-            let mut title = paint::style(13.0, false, paint::FG);
-            title.wrap = knave_ui::TextWrap::WordOrGlyph;
-            title.align = TextAlign::Center;
-            paint::text(
-                list,
-                Rect::new(bounds.x + 4.0, page.y + h + 12.0, bounds.width - 8.0, 40.0),
-                note.title(),
-                title,
-                clip,
-            );
-            let lines = note.text.bytes().filter(|b| *b == b'\n').count() + 1;
-            let mut meta = paint::style(11.0, false, paint::MUTED);
-            meta.align = TextAlign::Center;
-            paint::text(
-                list,
-                Rect::new(bounds.x, page.y + h + 51.0, bounds.width, 16.0),
-                format!("{lines} lines"),
-                meta,
-                clip,
             );
         }
     }
@@ -975,9 +1100,7 @@ impl Application for Notes {
         Ok(())
     }
     fn paint(&mut self, list: &mut DisplayList, measure: &mut dyn TextMeasurer) {
-        if self.page == Page::Overview {
-            self.paint_library(list);
-        } else if self.page == Page::Editor {
+        if self.page == Page::Editor {
             self.paint_tabs(list);
             if let Some(area) = self.scene.bounds(EDITOR)
                 && let Some(tab) = self.current()
@@ -990,6 +1113,7 @@ impl Application for Notes {
                     &self.settings,
                     area,
                     (self.focused, normal, &self.preedit),
+                    paint::Palette::from_scene(&self.scene),
                 );
             }
         }
@@ -1076,6 +1200,20 @@ impl Application for Notes {
                     self.save();
                     self.rebuild()?;
                 }
+                91 => {
+                    if let Some(id) = self.pending_delete.take() {
+                        self.delete_note(&id)?;
+                    }
+                }
+                92 => {
+                    self.pending_delete = None;
+                    self.rebuild()?;
+                }
+                87 => self.finish_rename()?,
+                88 => {
+                    self.rename_note = None;
+                    self.rebuild()?;
+                }
                 61 => {
                     self.save();
                     self.refresh_status()?;
@@ -1120,6 +1258,41 @@ impl Application for Notes {
                 }
                 _ => {}
             },
+            Action::Selected(owner, operation)
+                if (2000..2000 + PAGE_SIZE as u64).contains(&owner.0) =>
+            {
+                if let Some(id) = self
+                    .results
+                    .get(self.overview_page * PAGE_SIZE + (owner.0 - 2000) as usize)
+                    .cloned()
+                {
+                    match operation {
+                        1 => {
+                            self.rename_text = self
+                                .book
+                                .notes
+                                .iter()
+                                .find(|n| n.id == id)
+                                .map(Note::title)
+                                .unwrap_or_default();
+                            self.pending_delete = None;
+                            self.rename_note = Some(id);
+                            self.rebuild()?;
+                            self.scene.set_focus(Some(ElementId(86)))?;
+                        }
+                        2 => self.export_note(&id)?,
+                        3 => {
+                            self.rename_note = None;
+                            self.pending_delete = Some(id);
+                            self.rebuild()?;
+                            self.scene.set_focus(Some(ElementId(92)))?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Action::TextChanged(ElementId(86), text) => self.rename_text = text,
+            Action::Submitted(ElementId(86), _) => self.finish_rename()?,
             Action::TextChanged(SEARCH, text) => {
                 let edit = self.scene.widget(SEARCH).cloned();
                 self.query = text;

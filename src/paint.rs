@@ -9,10 +9,48 @@ use knave_ui::{
     Transform2D,
 };
 use unicode_segmentation::UnicodeSegmentation;
-pub const BG: Color = Color::rgba(28, 29, 38, 255);
-pub const FG: Color = Color::rgba(222, 225, 233, 255);
-pub const MUTED: Color = Color::rgba(140, 145, 164, 255);
-pub const ACCENT: Color = Color::rgba(106, 164, 229, 255);
+/// Colors resolved from the scene, including desktop and user overrides.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub bg: Color,
+    pub fg: Color,
+    pub muted: Color,
+    pub accent: Color,
+    pub surface: Color,
+    pub selected: Color,
+}
+impl Palette {
+    pub fn from_scene(scene: &knave_ui::toolkit::Scene) -> Self {
+        let style = scene
+            .computed_style(knave_ui::toolkit::ElementId(0))
+            .unwrap()
+            .style;
+        let role = |id| {
+            scene
+                .computed_style(knave_ui::toolkit::ElementId(id))
+                .unwrap()
+                .style
+                .text
+                .color
+        };
+        Self {
+            bg: style
+                .background
+                .and_then(|p| p.fill)
+                .unwrap_or(Color::BACKGROUND),
+            fg: style.text.color,
+            muted: scene
+                .computed_style(knave_ui::toolkit::ElementId(21))
+                .unwrap()
+                .style
+                .text
+                .color,
+            accent: role(90003),
+            surface: role(90001),
+            selected: role(90002),
+        }
+    }
+}
 pub fn rect(list: &mut DisplayList, bounds: Rect, color: Color, clip: Rect) {
     if bounds.width <= 0.0 || bounds.height <= 0.0 {
         return;
@@ -103,9 +141,10 @@ pub fn document(
     settings: &Settings,
     area: Rect,
     state: (bool, bool, &str),
+    palette: Palette,
 ) -> Metrics {
     let (focused, normal, preedit) = state;
-    let ts = style(settings.font_size as f32, true, FG);
+    let ts = style(settings.font_size as f32, true, palette.fg);
     let cell = measure.measure("0000000000", &ts, 10000.0).size[0] / 10.0;
     let cell = cell.max(1.0);
     let line = ts.line_height;
@@ -122,12 +161,12 @@ pub fn document(
         rows: ((area.height - 12.0) / line).floor().max(1.0) as usize,
         cols: ((area.width - gutter - 24.0) / cell).floor().max(1.0) as usize,
     };
-    rect(list, area, BG, area);
+    rect(list, area, palette.bg, area);
     if gutter > 0.0 {
         rect(
             list,
             Rect::new(area.x, area.y, gutter, area.height),
-            Color::rgba(25, 26, 34, 255),
+            palette.surface,
             area,
         );
     }
@@ -145,7 +184,7 @@ pub fn document(
             rect(
                 list,
                 Rect::new(content.x, y, content.width, line),
-                Color::rgba(35, 41, 55, 255),
+                palette.surface,
                 content,
             );
         }
@@ -156,7 +195,11 @@ pub fn document(
                 row + 1
             };
             let mut ns = ts.clone();
-            ns.color = if row == doc.row() { FG } else { MUTED };
+            ns.color = if row == doc.row() {
+                palette.fg
+            } else {
+                palette.muted
+            };
             ns.align = TextAlign::End;
             text(
                 list,
@@ -193,7 +236,7 @@ pub fn document(
                             count.max(1) as f32 * cell,
                             line,
                         ),
-                        Color::rgba(55, 83, 121, 255),
+                        palette.selected,
                         content,
                     );
                 }
@@ -207,7 +250,7 @@ pub fn document(
                             line,
                         ),
                         if g == "\t" { "→" } else { "·" },
-                        style(settings.font_size as f32, true, MUTED),
+                        style(settings.font_size as f32, true, palette.muted),
                         content,
                     );
                 }
@@ -226,7 +269,7 @@ pub fn document(
                     cell,
                     line,
                 ),
-                Color::rgba(55, 83, 121, 255),
+                palette.selected,
                 content,
             );
         }
@@ -249,11 +292,11 @@ pub fn document(
             rect(
                 list,
                 Rect::new(caret.x, caret.y, cell, line),
-                Color::rgba(165, 186, 211, 100),
+                palette.selected,
                 content,
             );
         } else {
-            rect(list, caret, ACCENT, content);
+            rect(list, caret, palette.accent, content);
         }
         if !preedit.is_empty() {
             text(
@@ -271,7 +314,7 @@ pub fn document(
                     preedit.graphemes(true).count() as f32 * cell,
                     1.0,
                 ),
-                ACCENT,
+                palette.accent,
                 content,
             );
         }
@@ -285,7 +328,7 @@ pub fn document(
         rect(
             list,
             Rect::new(area.x + area.width - 8.0, y, 6.0, h),
-            Color::rgba(85, 91, 108, 255),
+            palette.muted,
             area,
         );
     }
@@ -304,7 +347,7 @@ pub fn document(
         rect(
             list,
             Rect::new(x, area.y + area.height - 7.0, w, 5.0),
-            Color::rgba(85, 91, 108, 255),
+            palette.muted,
             area,
         );
     }

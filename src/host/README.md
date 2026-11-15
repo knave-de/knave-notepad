@@ -1,5 +1,5 @@
 This host is adapted from knave-de/knave-ui's `knave-app` at
-77bb28aab7bb07eae0a01a1611b6c89c2f51ad07. Its MIT license is retained here.
+6d32cccde0ee1b07b8a876c5439d595a7f6a89ee. Its MIT license is retained here.
 
 Notes needs document editing independently of the toolkit's form text inputs.
 The local host adds native-key, committed-text, and pointer interception;
@@ -14,3 +14,7 @@ Write an absolute output PNG path into that request file and cause a redraw
 writes the PNG, and removes the request file. No capture runs unless explicitly
 configured. This is useful when Xvfb cannot capture Vulkan presentation through
 XGetImage. Release builds do not enable capture.
+
+Desktop theme startup detection and live Settings portal subscriptions follow
+upstream knave-app. Updates invoke `theme_policy_changed` and `refresh_theme`,
+then redraw; custom painting resolves scene colors on each frame.

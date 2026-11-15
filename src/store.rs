@@ -113,13 +113,37 @@ impl Storage {
                 "Duplicate note IDs in notebook",
             ));
         }
+        book.notes.retain(|note| !note.text.is_empty());
+        for note in &mut book.notes {
+            if note.name.as_deref().is_some_and(|name| {
+                name.strip_prefix("Untitled Document ")
+                    .is_some_and(|number| number.parse::<usize>().is_ok())
+            }) {
+                note.name = None;
+            }
+        }
+        let ids: std::collections::HashSet<_> =
+            book.notes.iter().map(|note| note.id.clone()).collect();
         let mut tabs = std::collections::HashSet::new();
         book.tabs
             .retain(|id| ids.contains(id) && tabs.insert(id.clone()));
         Ok((book, settings))
     }
     pub fn save(&self, book: &Notebook, settings: &Settings) -> io::Result<()> {
-        atomic_json(&self.data.join("notebook.json"), book)?;
+        // Empty editor buffers are drafts, never persisted notes. Whitespace counts.
+        let notes: Vec<_> = book
+            .notes
+            .iter()
+            .filter(|note| !note.text.is_empty())
+            .cloned()
+            .collect();
+        let tabs = book
+            .tabs
+            .iter()
+            .filter(|id| notes.iter().any(|note| &note.id == *id))
+            .cloned()
+            .collect();
+        atomic_json(&self.data.join("notebook.json"), &Notebook { notes, tabs })?;
         atomic_json(&self.config.join("settings.json"), settings)
     }
 }
@@ -217,5 +241,37 @@ mod tests {
         fs::write(&path, b"broken").unwrap();
         assert!(storage.load().is_err());
         assert_eq!(fs::read(path).unwrap(), b"broken");
+    }
+}
+
+#[cfg(test)]
+mod empty_note_tests {
+    use super::*;
+    #[test]
+    fn loading_removes_legacy_empty_notes_and_generated_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let storage = Storage::open(data.clone(), dir.path().join("config")).unwrap();
+        let empty = Note::new();
+        let mut spaces = Note::new();
+        spaces.text = "  ".into();
+        spaces.name = Some("Untitled Document 4".into());
+        let mut named = Note::new();
+        named.text = "content".into();
+        named.name = Some("My name".into());
+        atomic_json(
+            &data.join("notebook.json"),
+            &Notebook {
+                tabs: vec![empty.id.clone(), spaces.id.clone()],
+                notes: vec![empty, spaces, named],
+            },
+        )
+        .unwrap();
+        let (book, _) = storage.load().unwrap();
+        assert_eq!(book.notes.len(), 2);
+        assert_eq!(book.tabs.len(), 1);
+        assert_eq!(book.notes[0].text, "  ");
+        assert_eq!(book.notes[0].title(), "Untitled note");
+        assert_eq!(book.notes[1].title(), "My name");
     }
 }

@@ -1,4 +1,4 @@
-// Adapted from knave-app at 77bb28a; see README.md and LICENSE in this directory.
+// Adapted from knave-app at 6d32ccc; see README.md and LICENSE in this directory.
 // Event-driven, single-window host for retained Knave UI scenes.
 //
 // Clipboard requests use the system clipboard; actions also reach the application.
@@ -76,9 +76,9 @@ pub trait Application {
     }
 }
 
-/// Run one window without loading or watching a desktop theme.
+/// Run one window following the desktop theme preference.
 pub fn run(title: &str, size: [f64; 2], app: impl Application + 'static) -> AppResult {
-    run_inner(title, size, app, None)
+    run_inner(title, size, app, None, true)
 }
 
 /// Run one window with a caller-supplied theme and optional live file updates.
@@ -93,13 +93,13 @@ pub fn run_with_theme_provider(
     app: impl Application + 'static,
     provider: Arc<dyn ThemeProvider>,
 ) -> AppResult {
-    run_inner(title, size, app, Some(provider))
+    run_inner(title, size, app, Some(provider), false)
 }
 
-/// Compatibility alias for [`run`].
+/// Run without changing the application theme.
 #[allow(dead_code)]
 pub fn run_unthemed(title: &str, size: [f64; 2], app: impl Application + 'static) -> AppResult {
-    run(title, size, app)
+    run_inner(title, size, app, None, false)
 }
 
 fn run_inner(
@@ -107,6 +107,7 @@ fn run_inner(
     size: [f64; 2],
     mut app: impl Application + 'static,
     provider: Option<Arc<dyn ThemeProvider>>,
+    follow_desktop: bool,
 ) -> AppResult {
     if size.iter().any(|v| !v.is_finite() || *v <= 0.0) {
         return Err("window dimensions must be finite and positive".into());
@@ -141,7 +142,34 @@ fn run_inner(
                 }
             }
         });
+    #[cfg(target_os = "linux")]
+    let desktop_watcher = if follow_desktop {
+        match theme::DesktopWatcher::start({
+            let proxy = event_loop.create_proxy();
+            move || proxy.send_event(()).is_ok()
+        }) {
+            Ok(watcher) => Some(watcher),
+            Err(error) => {
+                eprintln!("desktop theme: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    if let Some(watcher) = &desktop_watcher
+        && let Some(scheme) = *watcher.scheme.lock().unwrap()
+    {
+        app.scene().set_theme(scheme)?;
+    }
+    if follow_desktop {
+        let policy = app.scene().theme_policy();
+        app.theme_policy_changed(policy)?;
+    }
     let mut host = Host {
+        #[cfg(target_os = "linux")]
+        desktop_watcher,
         #[cfg(target_os = "linux")]
         watcher,
         #[cfg(target_os = "linux")]
@@ -409,6 +437,8 @@ fn scale_list(list: &mut knave_ui::DisplayList, scale: f32) {
 }
 
 struct Host<A> {
+    #[cfg(target_os = "linux")]
+    desktop_watcher: Option<theme::DesktopWatcher>,
     #[cfg(target_os = "linux")]
     watcher: Option<theme::Watcher>,
     #[cfg(target_os = "linux")]
@@ -706,6 +736,33 @@ impl<A: Application> Host<A> {
 impl<A: Application> ApplicationHandler for Host<A> {
     #[cfg(target_os = "linux")]
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        if let Some(watcher) = &self.desktop_watcher {
+            let scheme = *watcher.scheme.lock().unwrap();
+            if let Some(scheme) = scheme {
+                let mut policy = self.app.scene().theme_policy();
+                if policy.scheme != scheme {
+                    policy.scheme = scheme;
+                    let result = self
+                        .app
+                        .scene()
+                        .set_theme(scheme)
+                        .map_err(|error| Box::new(error) as Box<dyn Error>)
+                        .and_then(|()| self.app.theme_policy_changed(policy))
+                        .and_then(|()| {
+                            if let Some(gpu) = &mut self.gpu {
+                                self.app.refresh_theme(&mut gpu.painter)
+                            } else {
+                                Ok(())
+                            }
+                        });
+                    if let Err(error) = result {
+                        self.fail(event_loop, error);
+                        return;
+                    }
+                    self.sync(true);
+                }
+            }
+        }
         if let Some(watcher) = &self.watcher {
             watcher
                 .pending
