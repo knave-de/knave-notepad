@@ -36,6 +36,8 @@ else
 fi
 
 cargo build --release --locked --manifest-path "$project_dir/Cargo.toml"
+target_dir=$(cargo metadata --no-deps --format-version 1 --manifest-path "$project_dir/Cargo.toml" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 
 privilege=()
 if [[ $mode == system && $(id -u) -ne 0 ]]; then
@@ -47,7 +49,7 @@ if [[ $mode == system && $(id -u) -ne 0 ]]; then
     privilege=(sudo)
 fi
 
-"${privilege[@]}" install -Dm755 "$project_dir/target/release/knave-notepad" "$bin_dir/knave-notepad"
+"${privilege[@]}" install -Dm755 "$target_dir/release/knave-notepad" "$bin_dir/knave-notepad"
 "${privilege[@]}" install -Dm644 "$project_dir/data/knave-notepad.desktop" "$app_dir/knave-notepad.desktop"
 "${privilege[@]}" install -Dm644 "$project_dir/data/icons/knave-notepad.svg" "$icon_dir/knave-notepad.svg"
 
