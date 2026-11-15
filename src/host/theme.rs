@@ -115,7 +115,6 @@ mod tests {
 /// the listener, so application shutdown never leaves a theme worker behind.
 #[cfg(target_os = "linux")]
 pub struct DesktopWatcher {
-    connection: zbus::blocking::Connection,
     thread: Option<std::thread::JoinHandle<()>>,
     pub scheme: Arc<std::sync::Mutex<Option<knave_ui::toolkit::Theme>>>,
 }
@@ -124,28 +123,33 @@ impl DesktopWatcher {
     pub fn start(
         wake: impl Fn() -> bool + Send + 'static,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::subscribe(zbus::blocking::Connection::session()?, wake)
-    }
-
-    fn subscribe(
-        connection: zbus::blocking::Connection,
-        wake: impl Fn() -> bool + Send + 'static,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let settings = zbus::blocking::Proxy::new(
-            &connection,
-            "org.freedesktop.portal.Desktop",
-            "/org/freedesktop/portal/desktop",
-            "org.freedesktop.portal.Settings",
-        )?;
-        // Subscribe before reading to avoid losing a change during startup.
-        let signals = settings.receive_signal("SettingChanged")?;
-        let value: zbus::zvariant::OwnedValue =
-            settings.call("ReadOne", &("org.freedesktop.appearance", "color-scheme"))?;
-        let scheme = Arc::new(std::sync::Mutex::new(portal_scheme(value)));
+        let scheme = Arc::new(std::sync::Mutex::new(None));
         let shared = scheme.clone();
         let thread = std::thread::Builder::new()
             .name("desktop-theme".into())
             .spawn(move || {
+                let result = (|| -> Result<_, Box<dyn std::error::Error>> {
+                    let connection = zbus::blocking::connection::Builder::session()?
+                        .method_timeout(std::time::Duration::from_secs(2))
+                        .build()?;
+                    let settings = zbus::blocking::Proxy::new(
+                        &connection,
+                        "org.freedesktop.portal.Desktop",
+                        "/org/freedesktop/portal/desktop",
+                        "org.freedesktop.portal.Settings",
+                    )?;
+                    // Subscribe before reading to avoid losing a change during startup.
+                    let signals = settings.receive_signal("SettingChanged")?;
+                    let value: zbus::zvariant::OwnedValue =
+                        settings.call("ReadOne", &("org.freedesktop.appearance", "color-scheme"))?;
+                    Ok((connection, signals, portal_scheme(value)))
+                })();
+                let Ok((_connection, signals, initial)) = result else {
+                    let _ = wake();
+                    return;
+                };
+                *shared.lock().unwrap() = initial;
+                if !wake() { return; }
                 for message in signals {
                     let Ok((namespace, key, value)) =
                         message
@@ -163,18 +167,45 @@ impl DesktopWatcher {
                 }
             })?;
         Ok(Self {
-            connection,
             thread: Some(thread),
             scheme,
         })
+    }
+
+    #[cfg(test)]
+    fn subscribe(
+        connection: zbus::blocking::Connection,
+        wake: impl Fn() -> bool + Send + 'static,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let settings = zbus::blocking::Proxy::new(&connection,
+            "org.freedesktop.portal.Desktop", "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings")?;
+        let signals = settings.receive_signal("SettingChanged")?;
+        let value: zbus::zvariant::OwnedValue = settings.call("ReadOne",
+            &("org.freedesktop.appearance", "color-scheme"))?;
+        let scheme = Arc::new(std::sync::Mutex::new(portal_scheme(value)));
+        let shared = scheme.clone();
+        let thread = std::thread::spawn(move || {
+            for message in signals {
+                if let Ok((namespace, key, value)) = message.body()
+                    .deserialize::<(String, String, zbus::zvariant::OwnedValue)>()
+                    && namespace == "org.freedesktop.appearance" && key == "color-scheme" {
+                    *shared.lock().unwrap() = portal_scheme(value);
+                    if !wake() { break; }
+                }
+            }
+        });
+        let _ = connection;
+        Ok(Self { thread: Some(thread), scheme })
     }
 }
 #[cfg(target_os = "linux")]
 impl Drop for DesktopWatcher {
     fn drop(&mut self) {
-        let _ = self.connection.clone().close();
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            // The signal iterator exits when the private connection closes. Dropping
+            // the worker's connection is handled by its scope; avoid blocking shutdown.
+            drop(thread);
         }
     }
 }
