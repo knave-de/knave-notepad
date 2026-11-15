@@ -18,6 +18,13 @@ const SEARCH: ElementId = ElementId(30);
 const FIND: ElementId = ElementId(70);
 const REPLACE: ElementId = ElementId(71);
 const PAGE_SIZE: usize = 60;
+#[derive(Clone, Copy, Default, PartialEq)]
+enum OverviewSort {
+    #[default]
+    DateModified,
+    DateCreated,
+    TitleAscending,
+}
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Overview,
@@ -48,6 +55,7 @@ pub struct Notes {
     query: String,
     results: Vec<String>,
     overview_page: usize,
+    overview_sort: OverviewSort,
     metrics: Metrics,
     focused: bool,
     dragging: bool,
@@ -189,6 +197,7 @@ impl Notes {
             query: String::new(),
             results: vec![],
             overview_page: 0,
+            overview_sort: OverviewSort::default(),
             metrics: Metrics::default(),
             focused: false,
             dragging: false,
@@ -701,18 +710,53 @@ impl Notes {
             body.push(surface);
         } else if self.page == Page::Overview {
             let mut search = field(SEARCH.0, &self.query)?;
-            search.layout.width = Length::Px(260.0);
+            search.layout.width = Length::Px(220.0);
+            let mut title = heading(32, "All documents");
+            title.layout.width = Length::Fill;
+            let mut sort_label = label(54, "Sort by:");
+            sort_label.layout.width = Length::Px(56.0);
+            let mut sort_dropdown = Element::new(
+                56,
+                Widget::Dropdown {
+                    label: match self.overview_sort {
+                        OverviewSort::DateModified => "Date modified".into(),
+                        OverviewSort::DateCreated => "Date created".into(),
+                        OverviewSort::TitleAscending => "Title".into(),
+                    },
+                    items: vec![
+                        MenuItem::option(1, "Date modified"),
+                        MenuItem::option(2, "Date created"),
+                        MenuItem::option(3, "Title"),
+                    ],
+                    selected: Some(match self.overview_sort {
+                        OverviewSort::DateModified => 1,
+                        OverviewSort::DateCreated => 2,
+                        OverviewSort::TitleAscending => 3,
+                    }),
+                },
+            )
+            .class("sort-dropdown")
+            .layout(Layout {
+                width: Length::Px(180.0),
+                height: Length::Px(34.0),
+                ..Default::default()
+            });
+            sort_dropdown.style.text.align = TextAlign::Start;
+            sort_dropdown.layout.padding = 10.0;
+            let mut sort_controls = row(57, vec![sort_label, sort_dropdown]);
+            sort_controls.layout.width = Length::Auto;
             body.push(
                 row(
                     31,
                     vec![
-                        heading(32, "All documents"),
+                        title,
                         {
                             let mut e = label(33, "Search");
                             e.layout.width = Length::Px(48.0);
                             e
                         },
                         search,
+                        sort_controls,
                     ],
                 )
                 .layout(Layout {
@@ -776,13 +820,37 @@ impl Notes {
                 .book
                 .notes
                 .iter()
-                .filter(|n| {
-                    n.title().to_lowercase().contains(&query)
-                        || n.text.to_lowercase().contains(&query)
+                .filter_map(|note| {
+                    let title = note.title();
+                    let title_lower = title.to_lowercase();
+                    let matches = query.is_empty()
+                        || title_lower.contains(&query)
+                        || note.text.to_lowercase().contains(&query);
+                    matches.then_some((note, title_lower))
                 })
                 .collect();
-            notes.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
-            self.results = notes.iter().map(|n| n.id.clone()).collect();
+            notes.sort_by(|a, b| match self.overview_sort {
+                OverviewSort::DateModified => {
+                    b.0.updated
+                        .cmp(&a.0.updated)
+                        .then_with(|| a.0.id.cmp(&b.0.id))
+                }
+                OverviewSort::DateCreated => {
+                    let a_created = if a.0.created == 0 {
+                        a.0.updated
+                    } else {
+                        a.0.created
+                    };
+                    let b_created = if b.0.created == 0 {
+                        b.0.updated
+                    } else {
+                        b.0.created
+                    };
+                    b_created.cmp(&a_created).then_with(|| a.0.id.cmp(&b.0.id))
+                }
+                OverviewSort::TitleAscending => a.1.cmp(&b.1).then_with(|| a.0.id.cmp(&b.0.id)),
+            });
+            self.results = notes.iter().map(|(note, _)| note.id.clone()).collect();
             self.overview_page = self
                 .overview_page
                 .min(notes.len().saturating_sub(1) / PAGE_SIZE);
@@ -805,6 +873,7 @@ impl Notes {
                                 ..Default::default()
                             });
                     let excerpt = note
+                        .0
                         .text
                         .lines()
                         .take(12)
@@ -826,7 +895,7 @@ impl Notes {
                     preview.style.text.align = TextAlign::Start;
                     preview.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
                     cover.children = vec![preview];
-                    let mut title = label(6000 + slot, note.title()).class("document-title");
+                    let mut title = label(6000 + slot, note.0.title()).class("document-title");
                     title.layout.height = Length::Px(42.0);
                     title.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
                     let menu = Element::new(
@@ -981,7 +1050,7 @@ impl Notes {
         });
         root.paint_surface = true;
         self.scene.replace(root)?;
-        self.scene.set_stylesheet(":root { color: var(--text); } .note-surface { color: var(--surface-hover); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 600; } .document-cover:hover { background-color: var(--surface-hover); border-color: var(--border-strong); color: var(--text); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 9px; line-height: 12px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--text); } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 600; } .document-menu { background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } text-input { text-align: left; }")?;
+        self.scene.set_stylesheet(":root { color: var(--text); } .note-surface { color: var(--surface-hover); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 600; } .document-cover:hover { background-color: var(--surface-hover); border-color: var(--border-strong); color: var(--text); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 9px; line-height: 12px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--text); } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 600; } .document-menu { background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } .sort-dropdown { text-align: left; } text-input { text-align: left; }")?;
         Ok(())
     }
     fn paint_tabs(&mut self, list: &mut DisplayList) {
@@ -1258,6 +1327,15 @@ impl Application for Notes {
                 }
                 _ => {}
             },
+            Action::Selected(ElementId(56), selected) => {
+                self.overview_sort = match selected {
+                    2 => OverviewSort::DateCreated,
+                    3 => OverviewSort::TitleAscending,
+                    _ => OverviewSort::DateModified,
+                };
+                self.overview_page = 0;
+                self.rebuild()?;
+            }
             Action::Selected(owner, operation)
                 if (2000..2000 + PAGE_SIZE as u64).contains(&owner.0) =>
             {

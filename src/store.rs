@@ -13,14 +13,18 @@ pub struct Note {
     pub text: String,
     pub updated: u64,
     #[serde(default)]
+    pub created: u64,
+    #[serde(default)]
     pub name: Option<String>,
 }
 impl Note {
     pub fn new() -> Self {
+        let timestamp = now();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             text: String::new(),
-            updated: now(),
+            updated: timestamp,
+            created: timestamp,
             name: None,
         }
     }

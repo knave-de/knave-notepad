@@ -15,6 +15,56 @@ fn shortcut(app: &mut Notes, key: &str) {
     );
 }
 #[test]
+fn overview_sort_dropdown_selects_stable_date_and_title_ordering() {
+    let (_dir, mut app) = app();
+    app.book.notes = vec![
+        Note {
+            id: "b".into(),
+            text: "Beta".into(),
+            updated: 2,
+            created: 2,
+            name: None,
+        },
+        Note {
+            id: "a".into(),
+            text: "alpha".into(),
+            updated: 2,
+            created: 1,
+            name: None,
+        },
+        Note {
+            id: "c".into(),
+            text: "Gamma".into(),
+            updated: 3,
+            created: 3,
+            name: None,
+        },
+    ];
+    app.rebuild().unwrap();
+    assert!(matches!(
+        app.scene.widget(ElementId(56)),
+        Some(Widget::Dropdown {
+            selected: Some(1),
+            ..
+        })
+    ));
+    assert_eq!(app.results, ["c", "a", "b"]);
+
+    app.action(Action::Selected(ElementId(56), 3)).unwrap();
+    assert!(matches!(
+        app.scene.widget(ElementId(56)),
+        Some(Widget::Dropdown {
+            selected: Some(3),
+            ..
+        })
+    ));
+    assert_eq!(app.results, ["a", "b", "c"]);
+    app.action(Action::Selected(ElementId(56), 2)).unwrap();
+    assert_eq!(app.results, ["c", "b", "a"]);
+    app.action(Action::Selected(ElementId(56), 1)).unwrap();
+    assert_eq!(app.results, ["c", "a", "b"]);
+}
+#[test]
 fn actual_editor_hooks_indentation_selection_undo_and_restart() {
     let (dir, mut app) = app();
     app.create().unwrap();
@@ -381,6 +431,20 @@ fn library_and_settings_rows_align_at_small_window_size() {
     let search = app.scene.bounds(SEARCH).unwrap();
     let label = app.scene.bounds(ElementId(33)).unwrap();
     assert!((search.y + search.height / 2.0 - label.y - label.height / 2.0).abs() < 1.0);
+    let sort_label = app.scene.bounds(ElementId(54)).unwrap();
+    let sort_dropdown = app.scene.bounds(ElementId(56)).unwrap();
+    assert!((sort_dropdown.width - 180.0).abs() < 0.1);
+    assert!((sort_dropdown.x - sort_label.x - sort_label.width - 6.0).abs() < 1.0);
+    assert!((sort_dropdown.x + sort_dropdown.width - 620.0).abs() < 1.0);
+    assert_eq!(
+        app.scene
+            .computed_style(ElementId(56))
+            .unwrap()
+            .style
+            .text
+            .align,
+        TextAlign::Start
+    );
     let normal = app.scene.computed_style(ElementId(1000)).unwrap();
     let hover = app
         .scene
