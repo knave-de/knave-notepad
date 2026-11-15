@@ -297,6 +297,7 @@ fn continuous_tab_strip_reorders_and_closes_with_pointer_input() {
     let (_, mut app) = app();
     for _ in 0..8 {
         app.create().unwrap();
+        app.text("note").unwrap();
     }
     let first = app.book.tabs[0].clone();
     app.open(first.clone()).unwrap();
@@ -317,4 +318,126 @@ fn continuous_tab_strip_reorders_and_closes_with_pointer_input() {
         .unwrap();
     assert_eq!(app.book.tabs.len(), 7);
     assert_eq!(app.book.notes.len(), 8);
+}
+
+#[test]
+fn custom_surfaces_follow_theme_and_keep_user_colors_after_rebuild() {
+    let (_dir, mut app) = app();
+    app.scene.set_theme(Theme::Light).unwrap();
+    let light = paint::Palette::from_scene(&app.scene);
+    app.scene.set_theme(Theme::Dark).unwrap();
+    let dark = paint::Palette::from_scene(&app.scene);
+    assert_ne!(light.bg, dark.bg);
+    assert_ne!(light.fg, dark.fg);
+    app.scene
+        .set_theme_stylesheets(
+            Theme::Light,
+            "",
+            ":root { --text: #123456; --accent: #654321; --surface-selected: #abcdef; }",
+        )
+        .unwrap();
+    app.create().unwrap();
+    let palette = paint::Palette::from_scene(&app.scene);
+    assert_eq!(palette.fg, knave_ui::Color::rgba(0x12, 0x34, 0x56, 255));
+    assert_eq!(palette.accent, knave_ui::Color::rgba(0x65, 0x43, 0x21, 255));
+    assert_eq!(
+        palette.selected,
+        knave_ui::Color::rgba(0xab, 0xcd, 0xef, 255)
+    );
+}
+
+#[test]
+fn library_menu_renames_and_deletes_the_selected_note() {
+    let (dir, mut app) = app();
+    app.create().unwrap();
+    let first = app.active.clone().unwrap();
+    app.text("Keep this text").unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.action(Action::Selected(ElementId(2000), 1)).unwrap();
+    assert_eq!(app.rename_note.as_deref(), Some(first.as_str()));
+    app.action(Action::TextChanged(ElementId(86), "Renamed note".into()))
+        .unwrap();
+    app.action(Action::Activated(ElementId(87))).unwrap();
+    assert_eq!(app.book.notes[0].title(), "Renamed note");
+    assert_eq!(app.book.notes[0].text, "Keep this text");
+    app.delete_note(&first).unwrap();
+    assert!(app.book.notes.is_empty());
+    assert!(app.book.tabs.is_empty());
+    assert!(app.tabs.is_empty());
+    drop(app);
+    let storage = Storage::open(dir.path().join("data"), dir.path().join("config")).unwrap();
+    assert!(Notes::new(storage).unwrap().book.notes.is_empty());
+}
+
+#[test]
+fn library_and_settings_rows_align_at_small_window_size() {
+    let (_, mut app) = app();
+    app.create().unwrap();
+    app.text("note").unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.resize([640.0, 480.0]).unwrap();
+    let mut measure = Measure;
+    app.scene.display_list([640.0, 480.0], &mut measure);
+    let search = app.scene.bounds(SEARCH).unwrap();
+    let label = app.scene.bounds(ElementId(33)).unwrap();
+    assert!((search.y + search.height / 2.0 - label.y - label.height / 2.0).abs() < 1.0);
+    let normal = app.scene.computed_style(ElementId(1000)).unwrap();
+    let hover = app
+        .scene
+        .computed_style_for(
+            ElementId(1000),
+            InteractionState {
+                hovered: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(normal.style.background, hover.style.background);
+    app.action(Action::Activated(ElementId(5))).unwrap();
+    app.scene.display_list([640.0, 480.0], &mut measure);
+    let minus = app.scene.bounds(ElementId(46)).unwrap();
+    let plus = app.scene.bounds(ElementId(48)).unwrap();
+    let value = app.scene.bounds(ElementId(8041)).unwrap();
+    assert_eq!(minus.y, plus.y);
+    assert!((minus.y + minus.height / 2.0 - value.y - value.height / 2.0).abs() < 1.0);
+    assert!(plus.x + plus.width <= 640.0);
+}
+
+#[test]
+fn delete_menu_confirms_in_app_and_cancel_preserves_note() {
+    let (_, mut app) = app();
+    app.create().unwrap();
+    let id = app.active.clone().unwrap();
+    app.text("hello").unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.action(Action::Selected(ElementId(2000), 3)).unwrap();
+    assert_eq!(app.pending_delete.as_deref(), Some(id.as_str()));
+    assert_eq!(app.book.notes.len(), 1);
+    assert!(app.scene.widget(ElementId(91)).is_some());
+    app.action(Action::Activated(ElementId(92))).unwrap();
+    assert!(app.pending_delete.is_none());
+    assert_eq!(app.book.notes.len(), 1);
+    app.action(Action::Selected(ElementId(2000), 3)).unwrap();
+    app.action(Action::Activated(ElementId(91))).unwrap();
+    assert!(app.pending_delete.is_none());
+    assert!(app.book.notes.is_empty());
+    assert!(app.book.tabs.is_empty());
+}
+
+#[test]
+fn empty_notes_are_temporary_but_spaces_are_saved() {
+    let (_dir, mut app) = app();
+    app.create().unwrap();
+    assert_eq!(app.book.notes[0].title(), "Untitled note");
+    assert!(app.storage.load().unwrap().0.notes.is_empty());
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.book.notes.is_empty());
+    app.create().unwrap();
+    app.text(" ").unwrap();
+    assert_eq!(app.storage.load().unwrap().0.notes[0].text, " ");
+    app.current_mut().unwrap().doc.select_all();
+    key(&mut app, NamedKey::Backspace, ModifiersState::empty());
+    assert!(app.storage.load().unwrap().0.notes.is_empty());
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.book.notes.is_empty());
 }

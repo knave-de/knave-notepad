@@ -7,8 +7,8 @@ description = "Notes — an autosaving, tabbed notebook for Knave"
 repository = "https://github.com/knave-de/knave-notepad"
 
 [dependencies]
-knave-ui = { git = "https://github.com/knave-de/knave-ui", rev = "77bb28aab7bb07eae0a01a1611b6c89c2f51ad07" }
-knave-renderer = { git = "https://github.com/knave-de/knave-ui", rev = "77bb28aab7bb07eae0a01a1611b6c89c2f51ad07" }
+knave-ui = { git = "https://github.com/knave-de/knave-ui", rev = "6d32cccde0ee1b07b8a876c5439d595a7f6a89ee" }
+knave-renderer = { git = "https://github.com/knave-de/knave-ui", rev = "6d32cccde0ee1b07b8a876c5439d595a7f6a89ee" }
 wgpu = "30.0.1"
 pollster = "1.0.1"
 winit = "0.30.13"
@@ -29,3 +29,6 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5.19"

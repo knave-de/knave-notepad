@@ -18,12 +18,15 @@ portal through rfd.
 
 ```sh
 cargo run --locked
-make install PREFIX="$HOME/.local"
+scripts/install.sh             # system-wide, under /usr/local
+scripts/install.sh --user      # current user, under ~/.local
 ```
 
-For packaging, `make install DESTDIR=... PREFIX=/usr` installs the binary and
-launcher. The launcher uses the system theme's standard `accessories-text-editor`
-icon. There is no custom Notes icon yet.
+Use `scripts/install.sh --system` to state the system-wide choice explicitly.
+System installation needs write access to `/usr/local`; set `PREFIX` to choose
+another prefix. The installer builds the release binary and installs the desktop
+entry plus the scalable Notes icon. User installation uses `XDG_DATA_HOME` and
+`XDG_BIN_HOME` when set, otherwise `~/.local/share` and `~/.local/bin`.
 
 ## Editing
 
