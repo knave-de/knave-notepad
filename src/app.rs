@@ -604,7 +604,7 @@ impl Notes {
         let page_title = if self.page == Page::Settings {
             "Preferences"
         } else {
-            "Notes"
+            ""
         };
         let mut title = label(3, page_title);
         title.style.text.align = TextAlign::Center;
@@ -613,7 +613,7 @@ impl Notes {
         let mut header = row(
             1,
             vec![
-                button(2, if editing { "Library" } else { "Notes" }),
+                button(2, if editing || self.page == Page::Settings { "Library" } else { "Notes" }),
                 compact(4, "+"),
                 title,
                 button(9, "Open…"),
@@ -710,9 +710,8 @@ impl Notes {
             body.push(surface);
         } else if self.page == Page::Overview {
             let mut search = field(SEARCH.0, &self.query)?;
-            search.layout.width = Length::Px(220.0);
-            let mut title = heading(32, "All documents");
-            title.layout.width = Length::Fill;
+            search.layout.width = Length::Px(260.0);
+            search = search.class("library-search");
             let mut sort_label = label(54, "Sort by:");
             sort_label.layout.width = Length::Px(56.0);
             let mut sort_dropdown = Element::new(
@@ -742,14 +741,13 @@ impl Notes {
                 ..Default::default()
             });
             sort_dropdown.style.text.align = TextAlign::Start;
-            sort_dropdown.layout.padding = 10.0;
+            sort_dropdown.layout.padding = 6.0;
             let mut sort_controls = row(57, vec![sort_label, sort_dropdown]);
             sort_controls.layout.width = Length::Auto;
             body.push(
                 row(
                     31,
                     vec![
-                        title,
                         {
                             let mut e = label(33, "Search");
                             e.layout.width = Length::Px(48.0);
@@ -761,7 +759,7 @@ impl Notes {
                 )
                 .layout(Layout {
                     flow: Flow::Row,
-                    height: Length::Px(72.0),
+                    height: Length::Px(74.0),
                     align: Align::Center,
                     padding: 20.0,
                     ..Default::default()
@@ -775,45 +773,28 @@ impl Notes {
                     .find(|note| &note.id == id)
                     .map(Note::title)
                     .unwrap_or_default();
-                body.push(
-                    row(
-                        89,
-                        vec![
-                            label(90, format!("Delete “{title}”? This cannot be undone.")),
-                            button(91, "Delete"),
-                            button(92, "Cancel"),
-                        ],
-                    )
-                    .layout(Layout {
-                        flow: Flow::Row,
-                        align: Align::Center,
-                        height: Length::Px(64.0),
-                        padding: 12.0,
-                        gap: 8.0,
-                        ..Default::default()
-                    }),
-                );
+                let mut message = label(90, format!("Delete “{title}”?\nThis cannot be undone."));
+                message.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
+                body.push(Element::new(89, Widget::Popup { modal: true }).children(vec![
+                    message,
+                    row(93, vec![button(91, "Delete"), button(92, "Cancel")]),
+                ]).layout(Layout {
+                    width: Length::Px(360.0), height: Length::Px(150.0),
+                    padding: 20.0, gap: 20.0, ..Default::default()
+                }));
             }
+
             if self.rename_note.is_some() {
-                body.push(
-                    row(
-                        84,
-                        vec![
-                            label(85, "Name"),
-                            field(86, &self.rename_text)?,
-                            button(87, "Save"),
-                            button(88, "Cancel"),
-                        ],
-                    )
-                    .layout(Layout {
-                        flow: Flow::Row,
-                        align: Align::Center,
-                        height: Length::Px(52.0),
-                        padding: 10.0,
-                        gap: 8.0,
-                        ..Default::default()
-                    }),
-                );
+                let mut name = field(86, &self.rename_text)?;
+                name.layout.width = Length::Fill;
+                body.push(Element::new(84, Widget::Popup { modal: true }).children(vec![
+                    label(85, "Rename note"),
+                    name,
+                    row(94, vec![button(87, "Save"), button(88, "Cancel")]),
+                ]).layout(Layout {
+                    width: Length::Px(360.0), height: Length::Px(190.0),
+                    padding: 20.0, gap: 16.0, ..Default::default()
+                }));
             }
             let query = self.query.to_lowercase();
             let mut notes: Vec<_> = self
@@ -854,7 +835,7 @@ impl Notes {
             self.overview_page = self
                 .overview_page
                 .min(notes.len().saturating_sub(1) / PAGE_SIZE);
-            let cols = ((self.size[0] - 32.0) / 170.0).floor().max(1.0) as usize;
+            let cols = ((self.size[0] - 32.0) / 220.0).floor().max(1.0) as usize;
             let cards = notes
                 .iter()
                 .enumerate()
@@ -867,7 +848,7 @@ impl Notes {
                             .class("document-cover")
                             .layout(Layout {
                                 width: Length::Fill,
-                                height: Length::Px(166.0),
+                                height: Length::Px(220.0),
                                 padding: 16.0,
                                 align: Align::Center,
                                 ..Default::default()
@@ -876,7 +857,8 @@ impl Notes {
                         .0
                         .text
                         .lines()
-                        .take(12)
+                        .filter(|line| !line.trim().is_empty())
+                        .take(4)
                         .map(|line| {
                             line.chars()
                                 .take(100)
@@ -894,9 +876,10 @@ impl Notes {
                     };
                     preview.style.text.align = TextAlign::Start;
                     preview.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
-                    cover.children = vec![preview];
+
                     let mut title = label(6000 + slot, note.0.title()).class("document-title");
-                    title.layout.height = Length::Px(42.0);
+                    title.layout.height = Length::Px(32.0);
+                    title.layout.width = Length::Fill;
                     title.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
                     let menu = Element::new(
                         2000 + slot,
@@ -916,25 +899,34 @@ impl Notes {
                         height: Length::Px(30.0),
                         ..Default::default()
                     });
-                    panel(
-                        5000 + slot,
-                        vec![
-                            cover,
-                            row(7000 + slot, vec![title, menu]).layout(Layout {
-                                flow: Flow::Row,
-                                align: Align::Start,
-                                gap: 4.0,
-                                height: Length::Px(46.0),
+                    let age = now().saturating_sub(note.0.updated) / 1000;
+                    let modified = if age < 60 {
+                        "Modified just now".to_owned()
+                    } else if age < 3600 {
+                        format!("Modified {} min ago", age / 60)
+                    } else if age < 86400 {
+                        format!("Modified {} hours ago", age / 3600)
+                    } else {
+                        format!("Modified {} days ago", age / 86400)
+                    };
+                    cover.children = vec![
+                        row(7000 + slot, vec![title, menu]).layout(Layout {
+                            flow: Flow::Row,
+                            height: Length::Px(34.0),
+                            gap: 4.0,
+                            ..Default::default()
+                        }),
+                        preview,
+                        label(60000 + slot, modified)
+                            .class("document-date")
+                            .layout(Layout {
+                                height: Length::Px(20.0),
                                 ..Default::default()
                             }),
-                        ],
-                    )
-                    .layout(Layout {
-                        width: Length::Fill,
-                        height: Length::Px(224.0),
-                        gap: 12.0,
-                        ..Default::default()
-                    })
+                    ];
+                    cover.layout.flow = Flow::Column;
+                    cover.layout.gap = 12.0;
+                    cover
                 })
                 .collect::<Vec<_>>();
             let grid = panel(35, cards).layout(Layout {
@@ -1038,6 +1030,7 @@ impl Notes {
             (90001, "note-surface"),
             (90002, "note-selection"),
             (90003, "note-accent"),
+            (90004, "note-on-accent"),
         ] {
             let mut probe = label(id, "").class(class);
             probe.visible = false;
@@ -1050,7 +1043,15 @@ impl Notes {
         });
         root.paint_surface = true;
         self.scene.replace(root)?;
-        self.scene.set_stylesheet(":root { color: var(--text); } .note-surface { color: var(--surface-hover); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 600; } .document-cover:hover { background-color: var(--surface-hover); border-color: var(--border-strong); color: var(--text); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 9px; line-height: 12px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--text); } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 600; } .document-menu { background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } .sort-dropdown { text-align: left; } text-input { text-align: left; }")?;
+        self.scene.set_stylesheet(":root { color: var(--text); font-weight: 400; } menu-item { font-weight: 400; } .header { background-color: var(--surface-raised); border-bottom: 1px solid var(--border); } .status { background-color: var(--surface-raised); border-top: 1px solid var(--border); } .note-surface { color: var(--surface-raised); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .note-on-accent { color: var(--on-accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 400; } .document-cover:hover { background-color: var(--surface-selected); border-color: var(--accent); color: var(--accent); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 13px; line-height: 19px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--accent); } .document-cover:hover .document-title { color: var(--accent); } .document-date { color: var(--text-secondary); font-size: 11px; } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 400; } .document-menu { font-weight: 400; background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } .library-search { border: 1px solid var(--border-strong); background-color: var(--surface-raised); border-radius: 6px; } .sort-dropdown { text-align: left; } text-input { text-align: left; }")?;
+        if self.rename_note.is_some() {
+            self.scene.open_popup(ElementId(84))?;
+            self.scene.set_focus(Some(ElementId(86)))?;
+        }
+        if self.pending_delete.is_some() {
+            self.scene.open_popup(ElementId(89))?;
+            self.scene.set_focus(Some(ElementId(92)))?;
+        }
         Ok(())
     }
     fn paint_tabs(&mut self, list: &mut DisplayList) {
@@ -1098,7 +1099,11 @@ impl Notes {
             paint::rect(
                 list,
                 r,
-                if active { palette.surface } else { palette.bg },
+                if active {
+                    palette.selected
+                } else {
+                    palette.surface
+                },
                 area,
             );
             paint::rect(
@@ -1134,7 +1139,15 @@ impl Notes {
             } else {
                 title
             };
-            let mut style = paint::style(13.0, false, palette.fg);
+            let mut style = paint::style(
+                13.0,
+                false,
+                if active {
+                    palette.accent
+                } else {
+                    palette.muted
+                },
+            );
             style.align = TextAlign::Center;
             paint::text(
                 list,
@@ -1161,7 +1174,7 @@ impl Application for Notes {
         &mut self.scene
     }
     fn resize(&mut self, size: [f32; 2]) -> AppResult {
-        let changed = ((self.size[0] - 32.0) / 170.0).floor() != ((size[0] - 32.0) / 170.0).floor();
+        let changed = ((self.size[0] - 32.0) / 220.0).floor() != ((size[0] - 32.0) / 220.0).floor();
         self.size = size;
         if changed && self.page == Page::Overview {
             self.rebuild()?;
@@ -1219,10 +1232,12 @@ impl Application for Notes {
         match action {
             Action::Activated(id) => match id.0 {
                 2 => {
-                    self.page = Page::Overview;
+                    let return_to_note = self.page == Page::Overview && self.active.is_some();
+                    self.page = if return_to_note { Page::Editor } else { Page::Overview };
                     self.focused = false;
                     self.message = None;
                     self.rebuild()?;
+                    if return_to_note { self.focus_editor()?; }
                 }
                 4 => self.create()?,
                 5 => {
@@ -1368,6 +1383,14 @@ impl Application for Notes {
                         _ => {}
                     }
                 }
+            }
+            Action::PopupClosed(ElementId(84)) => {
+                self.rename_note = None;
+                self.rebuild()?;
+            }
+            Action::PopupClosed(ElementId(89)) => {
+                self.pending_delete = None;
+                self.rebuild()?;
             }
             Action::TextChanged(ElementId(86), text) => self.rename_text = text,
             Action::Submitted(ElementId(86), _) => self.finish_rename()?,

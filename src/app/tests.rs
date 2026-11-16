@@ -435,7 +435,8 @@ fn library_and_settings_rows_align_at_small_window_size() {
     let sort_dropdown = app.scene.bounds(ElementId(56)).unwrap();
     assert!((sort_dropdown.width - 180.0).abs() < 0.1);
     assert!((sort_dropdown.x - sort_label.x - sort_label.width - 6.0).abs() < 1.0);
-    assert!((sort_dropdown.x + sort_dropdown.width - 620.0).abs() < 1.0);
+    assert!(sort_dropdown.x + sort_dropdown.width <= 620.0);
+    assert!(sort_label.x >= search.x + search.width);
     assert_eq!(
         app.scene
             .computed_style(ElementId(56))
@@ -504,4 +505,43 @@ fn empty_notes_are_temporary_but_spaces_are_saved() {
     assert!(app.storage.load().unwrap().0.notes.is_empty());
     app.action(Action::Activated(ElementId(2))).unwrap();
     assert!(app.book.notes.is_empty());
+}
+
+#[test]
+fn library_toggle_returns_to_open_note_and_delete_uses_modal() {
+    let (_, mut app) = app();
+    app.create().unwrap();
+    app.text("Keep this note").unwrap();
+    let active = app.active.clone();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.page == Page::Overview);
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.page == Page::Editor);
+    assert_eq!(app.active, active);
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.action(Action::Selected(ElementId(2000), 3)).unwrap();
+    assert!(app.pending_delete.is_some());
+    assert!(matches!(app.scene.widget(ElementId(89)), Some(Widget::Popup { modal: true })));
+    app.action(Action::PopupClosed(ElementId(89))).unwrap();
+    assert!(app.pending_delete.is_none());
+    assert_eq!(app.book.notes.len(), 1);
+}
+
+#[test]
+fn rename_modal_cancels_without_changes_and_saves_name() {
+    let (_, mut app) = app();
+    app.create().unwrap();
+    app.text("Original").unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.action(Action::Selected(ElementId(2000), 1)).unwrap();
+    assert!(matches!(app.scene.widget(ElementId(84)), Some(Widget::Popup { modal: true })));
+    app.action(Action::TextChanged(ElementId(86), "Discarded".into())).unwrap();
+    app.action(Action::PopupClosed(ElementId(84))).unwrap();
+    assert!(app.rename_note.is_none());
+    assert_eq!(app.book.notes[0].title(), "Original");
+    app.action(Action::Selected(ElementId(2000), 1)).unwrap();
+    app.action(Action::TextChanged(ElementId(86), "Renamed".into())).unwrap();
+    app.action(Action::Activated(ElementId(87))).unwrap();
+    assert!(app.rename_note.is_none());
+    assert_eq!(app.book.notes[0].title(), "Renamed");
 }
