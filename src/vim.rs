@@ -99,6 +99,16 @@ impl VimEditor {
         Ok(())
     }
     pub fn key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<(), String> {
+        // Modalkit omits Vim's visual `s` alias for changing the selection.
+        let code = if self.mode() == VimMode::Visual
+            && code == KeyCode::Char('s')
+            && !modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            KeyCode::Char('c')
+        } else {
+            code
+        };
         self.machine
             .input_key(KeyEvent::new(code, modifiers).into());
         let viewport = ViewportContext {
@@ -316,5 +326,37 @@ mod tests {
         assert_eq!(vim.text(), "llo world");
         keys(&mut vim, "P");
         assert_eq!(vim.text(), "hello world");
+    }
+    #[test]
+    fn visual_substitute_changes_selection_and_enters_insert() {
+        for selection in ["vl", "lvh"] {
+            let mut vim = VimEditor::new("hello world", 0);
+            keys(&mut vim, selection);
+            keys(&mut vim, "s");
+            assert_eq!(vim.text(), "llo world");
+            assert!(vim.insert_mode());
+            keys(&mut vim, "Hi");
+            assert_eq!(vim.text(), "Hillo world");
+            vim.key(KeyCode::Esc, KeyModifiers::NONE).unwrap();
+            keys(&mut vim, "u");
+            assert_eq!(vim.text(), "hello world");
+        }
+    }
+    #[test]
+    fn visual_substitute_changes_mouse_selection() {
+        let mut vim = VimEditor::new("héllo world", 0);
+        vim.mouse_selection("héllo world", 3, 0).unwrap();
+        keys(&mut vim, "s");
+        assert_eq!(vim.text(), "llo world");
+        assert!(vim.insert_mode());
+        keys(&mut vim, "Hi");
+        assert_eq!(vim.text(), "Hillo world");
+    }
+    #[test]
+    fn normal_substitute_still_changes_one_character() {
+        let mut vim = VimEditor::new("hello", 0);
+        keys(&mut vim, "sH");
+        assert_eq!(vim.text(), "Hello");
+        assert!(vim.insert_mode());
     }
 }
