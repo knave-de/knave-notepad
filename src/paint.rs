@@ -101,6 +101,7 @@ pub struct Metrics {
     pub line: f32,
     pub rows: usize,
     pub cols: usize,
+    pub wrap: bool,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -111,17 +112,127 @@ impl Default for Metrics {
             line: 23.0,
             rows: 24,
             cols: 80,
+            wrap: false,
         }
     }
 }
+// Each visual row retains logical columns for tab expansion and byte hit testing.
+#[derive(Debug)]
+struct VisualRow {
+    row: usize,
+    start: usize,
+    end: usize,
+}
 impl Metrics {
+    fn visual_rows(&self, doc: &Document, width: usize) -> Vec<VisualRow> {
+        let mut rows = Vec::new();
+        for row in 0..doc.lines() {
+            if !self.wrap {
+                rows.push(VisualRow {
+                    row,
+                    start: 0,
+                    end: usize::MAX,
+                });
+                continue;
+            }
+            let mut start = 0;
+            let mut col = 0;
+            let mut boundary = None;
+            let glyphs: Vec<_> = doc.line(row).graphemes(true).collect();
+            let mut index = 0;
+            let mut segment_index = 0;
+            while index < glyphs.len() {
+                let g = glyphs[index];
+                let next = col + cells(g, col, width);
+                if self.wrap && next > start + self.cols && index > segment_index {
+                    let (split_index, split_col) = boundary
+                        .filter(|(i, _)| *i > segment_index)
+                        .unwrap_or((index, col));
+                    rows.push(VisualRow {
+                        row,
+                        start,
+                        end: split_col,
+                    });
+                    start = split_col;
+                    col = split_col;
+                    index = split_index;
+                    segment_index = index;
+                    boundary = None;
+                    continue;
+                }
+                col = next;
+                index += 1;
+                if g.chars().all(char::is_whitespace) {
+                    boundary = Some((index, col));
+                }
+            }
+            rows.push(VisualRow {
+                row,
+                start,
+                end: col,
+            });
+        }
+        rows
+    }
+    pub fn total_rows(&self, doc: &Document, width: usize) -> usize {
+        if self.wrap {
+            self.visual_rows(doc, width).len()
+        } else {
+            doc.lines()
+        }
+    }
+    fn position(&self, doc: &Document, width: usize) -> (usize, usize) {
+        let col = doc.column(width);
+        if !self.wrap {
+            return (doc.row(), col);
+        }
+        let rows = self.visual_rows(doc, width);
+        let index = rows
+            .iter()
+            .rposition(|r| r.row == doc.row() && r.start <= col)
+            .unwrap_or(0);
+        (index, col - rows[index].start)
+    }
+    pub fn vertical(&self, doc: &mut Document, delta: isize, extend: bool, width: usize) {
+        if !self.wrap {
+            doc.vertical(delta, extend, width);
+            return;
+        }
+        let rows = self.visual_rows(doc, width);
+        let (row, col) = self.position(doc, width);
+        let target = &rows[row.saturating_add_signed(delta).min(rows.len() - 1)];
+        let byte = doc.byte_at_column(target.row, (target.start + col).min(target.end), width);
+        doc.place(byte, extend);
+    }
+    pub fn reveal(&self, doc: &mut Document, width: usize) {
+        if !self.wrap {
+            doc.reveal(self.rows, self.cols, width);
+            return;
+        }
+        doc.scroll_col = 0;
+        let (row, _) = self.position(doc, width);
+        if row < doc.scroll_row {
+            doc.scroll_row = row;
+        }
+        if row >= doc.scroll_row + self.rows {
+            doc.scroll_row = row + 1 - self.rows;
+        }
+    }
+
     pub fn caret(&self, doc: &Document, width: usize) -> Rect {
+        let (row, col) = self.position(doc, width);
         Rect::new(
             self.area.x
                 + self.gutter
                 + 8.0
-                + (doc.column(width) as f32 - doc.scroll_col as f32) * self.cell,
-            self.area.y + 4.0 + (doc.row() as f32 - doc.scroll_row as f32) * self.line,
+                + (col as f32
+                    - if self.wrap {
+                        0.0
+                    } else {
+                        doc.scroll_col as f32
+                    })
+                    * self.cell,
+            self.area.y + 4.0 + (row as f32 - doc.scroll_row as f32) * self.line,
             2.0,
             self.line,
         )
@@ -130,16 +241,25 @@ impl Metrics {
         let row = (doc.scroll_row as isize
             + ((p[1] - self.area.y - 4.0) / self.line).floor() as isize)
             .max(0) as usize;
-        let col = (doc.scroll_col as f32 + (p[0] - self.area.x - self.gutter - 8.0) / self.cell)
+        let col = ((if self.wrap {
+            0.0
+        } else {
+            doc.scroll_col as f32
+        }) + (p[0] - self.area.x - self.gutter - 8.0) / self.cell)
             .round()
             .max(0.0) as usize;
+        if self.wrap {
+            let rows = self.visual_rows(doc, width);
+            let visual = &rows[row.min(rows.len() - 1)];
+            return doc.byte_at_column(visual.row, (visual.start + col).min(visual.end), width);
+        }
         doc.byte_at_column(row.min(doc.lines() - 1), col, width)
     }
 }
 pub fn document(
     list: &mut DisplayList,
     measure: &mut dyn TextMeasurer,
-    doc: &Document,
+    doc: &mut Document,
     settings: &Settings,
     area: Rect,
     state: (bool, bool, &str),
@@ -162,6 +282,7 @@ pub fn document(
         line,
         rows: ((area.height - 12.0) / line).floor().max(1.0) as usize,
         cols: ((area.width - gutter - 24.0) / cell).floor().max(1.0) as usize,
+        wrap: settings.word_wrap,
     };
     rect(list, area, palette.bg, area);
     if gutter > 0.0 {
@@ -180,8 +301,24 @@ pub fn document(
     );
     let selection = doc.selection();
     let width = settings.tab_width as usize;
-    for row in doc.scroll_row..(doc.scroll_row + metrics.rows + 2).min(doc.lines()) {
-        let y = area.y + 4.0 + (row - doc.scroll_row) as f32 * line;
+    let visual_rows = metrics.visual_rows(doc, width);
+    doc.scroll_row = doc.scroll_row.min(visual_rows.len().saturating_sub(1));
+    if metrics.wrap {
+        doc.scroll_col = 0;
+    }
+    for (visual_index, visual) in visual_rows
+        .iter()
+        .enumerate()
+        .skip(doc.scroll_row)
+        .take(metrics.rows + 2)
+    {
+        let row = visual.row;
+        let scroll_col = if metrics.wrap {
+            visual.start
+        } else {
+            doc.scroll_col
+        };
+        let y = area.y + 4.0 + (visual_index - doc.scroll_row) as f32 * line;
         if settings.highlight_line && row == doc.row() {
             rect(
                 list,
@@ -190,7 +327,7 @@ pub fn document(
                 content,
             );
         }
-        if settings.line_numbers {
+        if settings.line_numbers && visual.start == 0 {
             let number = if settings.relative_numbers && row != doc.row() {
                 row.abs_diff(doc.row())
             } else {
@@ -219,7 +356,10 @@ pub fn document(
         for (byte, g) in doc.line(row).grapheme_indices(true) {
             let count = cells(g, col, width);
             let endcol = col + count;
-            if endcol >= doc.scroll_col && col <= doc.scroll_col + metrics.cols + 2 {
+            if endcol > scroll_col
+                && (!metrics.wrap || col < visual.end)
+                && col <= scroll_col + metrics.cols + 2
+            {
                 if !begun {
                     draw_col = col;
                     begun = true;
@@ -233,7 +373,7 @@ pub fn document(
                     rect(
                         list,
                         Rect::new(
-                            content.x + 8.0 + (col as f32 - doc.scroll_col as f32) * cell,
+                            content.x + 8.0 + (col as f32 - scroll_col as f32) * cell,
                             y,
                             count.max(1) as f32 * cell,
                             line,
@@ -246,7 +386,7 @@ pub fn document(
                     text(
                         list,
                         Rect::new(
-                            content.x + 8.0 + (col as f32 - doc.scroll_col as f32) * cell,
+                            content.x + 8.0 + (col as f32 - scroll_col as f32) * cell,
                             y,
                             count as f32 * cell,
                             line,
@@ -258,15 +398,18 @@ pub fn document(
                 }
             }
             col = endcol;
-            if col > doc.scroll_col + metrics.cols + 3 {
+            if col > scroll_col + metrics.cols + 3 {
                 break;
             }
         }
-        if selection.start <= doc.end(row) && selection.end > doc.end(row) {
+        if (!metrics.wrap || visual.end == crate::editor::columns(doc.line(row), width))
+            && selection.start <= doc.end(row)
+            && selection.end > doc.end(row)
+        {
             rect(
                 list,
                 Rect::new(
-                    content.x + 8.0 + (col as f32 - doc.scroll_col as f32) * cell,
+                    content.x + 8.0 + (col as f32 - scroll_col as f32) * cell,
                     y,
                     cell,
                     line,
@@ -278,7 +421,7 @@ pub fn document(
         text(
             list,
             Rect::new(
-                content.x + 8.0 + (draw_col as f32 - doc.scroll_col as f32) * cell,
+                content.x + 8.0 + (draw_col as f32 - scroll_col as f32) * cell,
                 y,
                 (metrics.cols + 5) as f32 * cell,
                 line,
@@ -332,11 +475,12 @@ pub fn document(
         }
     }
     // Vertical scrollbar and horizontal scroll position share the document viewport.
-    if doc.lines() > metrics.rows {
-        let h = (area.height * metrics.rows as f32 / doc.lines() as f32).max(22.0);
+    let total_rows = visual_rows.len();
+    if total_rows > metrics.rows {
+        let h = (area.height * metrics.rows as f32 / total_rows as f32).max(22.0);
         let y = area.y
             + (area.height - h)
-                * (doc.scroll_row as f32 / (doc.lines() - metrics.rows) as f32).min(1.0);
+                * (doc.scroll_row as f32 / (total_rows - metrics.rows) as f32).min(1.0);
         rect(
             list,
             Rect::new(area.x + area.width - 8.0, y, 6.0, h),
@@ -344,9 +488,10 @@ pub fn document(
             area,
         );
     }
-    if doc.scroll_col > 0
-        || (doc.scroll_row..(doc.scroll_row + metrics.rows).min(doc.lines()))
-            .any(|r| crate::editor::columns(doc.line(r), width) > metrics.cols)
+    if !metrics.wrap
+        && (doc.scroll_col > 0
+            || (doc.scroll_row..(doc.scroll_row + metrics.rows).min(doc.lines()))
+                .any(|r| crate::editor::columns(doc.line(r), width) > metrics.cols))
     {
         let longest = (doc.scroll_row..(doc.scroll_row + metrics.rows).min(doc.lines()))
             .map(|r| crate::editor::columns(doc.line(r), width))
@@ -364,4 +509,39 @@ pub fn document(
         );
     }
     metrics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapping_preserves_words_and_maps_caret_and_hits() {
+        let mut doc = Document::new("hello world abcdefghijk\n\t界é".into());
+        let metrics = Metrics {
+            wrap: true,
+            cols: 8,
+            rows: 2,
+            gutter: 0.0,
+            cell: 10.0,
+            line: 20.0,
+            ..Default::default()
+        };
+        let rows = metrics.visual_rows(&doc, 4);
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.row, r.start, r.end))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 6), (0, 6, 12), (0, 12, 20), (0, 20, 23), (1, 0, 7)]
+        );
+        doc.place(8, false);
+        assert_eq!(metrics.position(&doc, 4), (1, 2));
+        assert_eq!(metrics.hit(&doc, [28.0, 24.0], 4), 8);
+        doc.place(23, false);
+        metrics.reveal(&mut doc, 4);
+        assert_eq!(doc.scroll_row, 2);
+        assert_eq!(doc.scroll_col, 0);
+        assert_eq!(metrics.caret(&doc, 4).y, 24.0);
+        assert_eq!(doc.text, "hello world abcdefghijk\n\t界é");
+    }
 }
