@@ -47,6 +47,7 @@ pub struct Notes {
     book: Notebook,
     settings: Settings,
     page: Page,
+    settings_return: Option<Page>,
     active: Option<String>,
     tabs: HashMap<String, Tab>,
     modal_store:
@@ -190,6 +191,7 @@ impl Notes {
             book,
             settings,
             page: Page::Overview,
+            settings_return: None,
             active: None,
             tabs: HashMap::new(),
             modal_store: Rc::new(RefCell::new(Default::default())),
@@ -308,6 +310,14 @@ impl Notes {
                 .vim
                 .then(|| VimEditor::with_store(&doc.text, 0, self.modal_store.clone()));
             self.tabs.insert(id.into(), Tab { doc, vim });
+        }
+        Ok(())
+    }
+    fn leave_settings(&mut self) -> AppResult {
+        self.page = self.settings_return.take().unwrap_or(Page::Overview);
+        self.rebuild()?;
+        if self.page == Page::Editor {
+            self.focus_editor()?;
         }
         Ok(())
     }
@@ -580,7 +590,9 @@ impl Notes {
     fn rebuild(&mut self) -> AppResult {
         // Keep the active blank buffer editable (including undo), but discard
         // empty drafts as soon as the user leaves them.
-        let keep = if self.page == Page::Editor {
+        let keep = if self.page == Page::Editor
+            || (self.page == Page::Settings && self.settings_return == Some(Page::Editor))
+        {
             self.active.as_deref()
         } else {
             None
@@ -613,7 +625,16 @@ impl Notes {
         let mut header = row(
             1,
             vec![
-                button(2, if editing || self.page == Page::Settings { "Library" } else { "Notes" }),
+                button(
+                    2,
+                    if self.page == Page::Settings {
+                        "Back"
+                    } else if editing {
+                        "Library"
+                    } else {
+                        "Notes"
+                    },
+                ),
                 compact(4, "+"),
                 title,
                 button(9, "Open…"),
@@ -1231,16 +1252,26 @@ impl Application for Notes {
     fn action(&mut self, action: Action) -> AppResult {
         match action {
             Action::Activated(id) => match id.0 {
+                2 if self.page == Page::Settings => self.leave_settings()?,
                 2 => {
                     let return_to_note = self.page == Page::Overview && self.active.is_some();
-                    self.page = if return_to_note { Page::Editor } else { Page::Overview };
+                    self.page = if return_to_note {
+                        Page::Editor
+                    } else {
+                        Page::Overview
+                    };
                     self.focused = false;
                     self.message = None;
                     self.rebuild()?;
-                    if return_to_note { self.focus_editor()?; }
+                    if return_to_note {
+                        self.focus_editor()?;
+                    }
                 }
                 4 => self.create()?,
                 5 => {
+                    if self.page != Page::Settings {
+                        self.settings_return = Some(self.page);
+                    }
                     self.page = Page::Settings;
                     self.focused = false;
                     self.message = None;
@@ -1707,6 +1738,10 @@ impl Application for Notes {
     }
     fn key(&mut self, key: &NativeKey, modifiers: ModifiersState) -> AppResult<bool> {
         self.modifiers = modifiers;
+        if self.page == Page::Settings && matches!(key, NativeKey::Named(NamedKey::Escape)) {
+            self.leave_settings()?;
+            return Ok(true);
+        }
         let control = modifiers.control_key() || modifiers.super_key();
         let shift = modifiers.shift_key();
         if control {
