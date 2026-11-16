@@ -16,6 +16,7 @@ pub struct Palette {
     pub fg: Color,
     pub muted: Color,
     pub accent: Color,
+    pub on_accent: Color,
     pub surface: Color,
     pub selected: Color,
 }
@@ -46,6 +47,7 @@ impl Palette {
                 .text
                 .color,
             accent: role(90003),
+            on_accent: role(90004),
             surface: role(90001),
             selected: role(90002),
         }
@@ -292,9 +294,19 @@ pub fn document(
             rect(
                 list,
                 Rect::new(caret.x, caret.y, cell, line),
-                palette.selected,
+                palette.accent,
                 content,
             );
+            let glyph = doc.text[doc.cursor..].graphemes(true).next().unwrap_or(" ");
+            if glyph != "\n" && glyph != "\t" {
+                text(
+                    list,
+                    Rect::new(caret.x, caret.y, cell * 2.0, line),
+                    glyph,
+                    style(settings.font_size as f32, true, palette.on_accent),
+                    content,
+                );
+            }
         } else {
             rect(list, caret, palette.accent, content);
         }
