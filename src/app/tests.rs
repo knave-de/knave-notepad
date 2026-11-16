@@ -549,6 +549,51 @@ fn rename_modal_cancels_without_changes_and_saves_name() {
 }
 
 #[test]
+fn settings_back_restores_editor_and_keeps_empty_draft_history() {
+    let (_dir, mut app) = app();
+    app.create().unwrap();
+    app.text("draft").unwrap();
+    shortcut(&mut app, "z");
+    let active = app.active.clone();
+    assert!(app.current().unwrap().doc.text.is_empty());
+    app.action(Action::Activated(ElementId(5))).unwrap();
+    app.action(Action::Activated(ElementId(5))).unwrap();
+    assert_eq!(app.active, active);
+    assert!(matches!(app.scene.widget(ElementId(2)), Some(Widget::Button(label)) if label == "Back"));
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.page == Page::Editor);
+    assert!(app.focused);
+    assert_eq!(app.active, active);
+    shortcut(&mut app, "y");
+    assert_eq!(app.current().unwrap().doc.text, "draft");
+    app.current_mut().unwrap().doc.cursor = 3;
+    app.current_mut().unwrap().doc.anchor = 1;
+    app.current_mut().unwrap().doc.scroll_row = 7;
+    app.current_mut().unwrap().doc.scroll_col = 2;
+    app.action(Action::Activated(ElementId(5))).unwrap();
+    key(&mut app, NamedKey::Escape, ModifiersState::empty());
+    let doc = &app.current().unwrap().doc;
+    assert_eq!((doc.cursor, doc.anchor, doc.scroll_row, doc.scroll_col), (3, 1, 7, 2));
+}
+
+#[test]
+fn settings_back_returns_to_filtered_library_with_an_active_note() {
+    let (_dir, mut app) = app();
+    app.create().unwrap();
+    app.text("keep this note").unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    app.action(Action::TextChanged(SEARCH, "keep".into())).unwrap();
+    app.overview_sort = OverviewSort::TitleAscending;
+    let results = app.results.clone();
+    app.action(Action::Activated(ElementId(5))).unwrap();
+    app.action(Action::Activated(ElementId(2))).unwrap();
+    assert!(app.page == Page::Overview);
+    assert_eq!(app.query, "keep");
+    assert!(app.overview_sort == OverviewSort::TitleAscending);
+    assert_eq!(app.results, results);
+}
+
+#[test]
 fn word_wrap_renders_long_line_as_multiple_rows_without_changing_text() {
     let (_, mut app) = app();
     app.create().unwrap();
