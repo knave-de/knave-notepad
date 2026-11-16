@@ -65,6 +65,7 @@ pub struct Settings {
     pub auto_indent: bool,
     pub highlight_line: bool,
     pub show_whitespace: bool,
+    pub word_wrap: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -78,6 +79,7 @@ impl Default for Settings {
             auto_indent: true,
             highlight_line: true,
             show_whitespace: false,
+            word_wrap: false,
         }
     }
 }

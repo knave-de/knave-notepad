@@ -110,7 +110,8 @@ fn actual_editor_hooks_indentation_selection_undo_and_restart() {
         .unwrap();
     assert_eq!(app.results, vec![first]);
     app.action(Action::Activated(ElementId(5))).unwrap();
-    for id in [42, 44, 57] {
+    assert!(!app.settings.word_wrap);
+    for id in [42, 44, 57, 63] {
         app.action(Action::Toggled(ElementId(id), true)).unwrap();
     }
     app.action(Action::Activated(ElementId(54))).unwrap();
@@ -122,6 +123,7 @@ fn actual_editor_hooks_indentation_selection_undo_and_restart() {
     assert_eq!(app.book.tabs.len(), 2);
     assert!(app.settings.relative_numbers);
     assert!(app.settings.show_whitespace);
+    assert!(app.settings.word_wrap);
     assert_eq!(app.settings.tab_width, 5);
 }
 #[test]
@@ -589,4 +591,25 @@ fn settings_back_returns_to_filtered_library_with_an_active_note() {
     assert_eq!(app.query, "keep");
     assert!(app.overview_sort == OverviewSort::TitleAscending);
     assert_eq!(app.results, results);
+}
+
+#[test]
+fn word_wrap_renders_long_line_as_multiple_rows_without_changing_text() {
+    let (_, mut app) = app();
+    app.create().unwrap();
+    let text = "hello world ".repeat(30);
+    app.text(&text).unwrap();
+    app.action(Action::Toggled(ElementId(63), true)).unwrap();
+    app.current_mut().unwrap().doc.place(0, false);
+    let mut measure = Measure;
+    let mut list = app.scene.display_list([400.0, 480.0], &mut measure).clone();
+    app.paint(&mut list, &mut measure);
+    let rows: Vec<_> = list.commands.iter().filter_map(|command| match command {
+        knave_ui::DisplayCommand::Text { bounds, text, .. } if text.starts_with("hello ") => Some(bounds.y),
+        _ => None,
+    }).collect();
+    assert!(rows.len() > 1);
+    assert!(rows.windows(2).all(|pair| pair[1] > pair[0]));
+    assert_eq!(app.current().unwrap().doc.text, text);
+    assert_eq!(app.current().unwrap().doc.scroll_col, 0);
 }
