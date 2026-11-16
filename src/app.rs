@@ -373,7 +373,7 @@ impl Notes {
         let metrics = self.metrics;
         let width = self.settings.tab_width as usize;
         if let Some(tab) = self.current_mut() {
-            tab.doc.reveal(metrics.rows, metrics.cols, width);
+            metrics.reveal(&mut tab.doc, width);
         }
         self.refresh_status()
     }
@@ -775,26 +775,40 @@ impl Notes {
                     .unwrap_or_default();
                 let mut message = label(90, format!("Delete “{title}”?\nThis cannot be undone."));
                 message.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
-                body.push(Element::new(89, Widget::Popup { modal: true }).children(vec![
-                    message,
-                    row(93, vec![button(91, "Delete"), button(92, "Cancel")]),
-                ]).layout(Layout {
-                    width: Length::Px(360.0), height: Length::Px(150.0),
-                    padding: 20.0, gap: 20.0, ..Default::default()
-                }));
+                body.push(
+                    Element::new(89, Widget::Popup { modal: true })
+                        .children(vec![
+                            message,
+                            row(93, vec![button(91, "Delete"), button(92, "Cancel")]),
+                        ])
+                        .layout(Layout {
+                            width: Length::Px(360.0),
+                            height: Length::Px(150.0),
+                            padding: 20.0,
+                            gap: 20.0,
+                            ..Default::default()
+                        }),
+                );
             }
 
             if self.rename_note.is_some() {
                 let mut name = field(86, &self.rename_text)?;
                 name.layout.width = Length::Fill;
-                body.push(Element::new(84, Widget::Popup { modal: true }).children(vec![
-                    label(85, "Rename note"),
-                    name,
-                    row(94, vec![button(87, "Save"), button(88, "Cancel")]),
-                ]).layout(Layout {
-                    width: Length::Px(360.0), height: Length::Px(190.0),
-                    padding: 20.0, gap: 16.0, ..Default::default()
-                }));
+                body.push(
+                    Element::new(84, Widget::Popup { modal: true })
+                        .children(vec![
+                            label(85, "Rename note"),
+                            name,
+                            row(94, vec![button(87, "Save"), button(88, "Cancel")]),
+                        ])
+                        .layout(Layout {
+                            width: Length::Px(360.0),
+                            height: Length::Px(190.0),
+                            padding: 20.0,
+                            gap: 16.0,
+                            ..Default::default()
+                        }),
+                );
             }
             let query = self.query.to_lowercase();
             let mut notes: Vec<_> = self
@@ -992,6 +1006,7 @@ impl Notes {
                 toggle(55, "Automatic indentation", self.settings.auto_indent),
                 toggle(56, "Highlight current line", self.settings.highlight_line),
                 toggle(57, "Show spaces and tabs", self.settings.show_whitespace),
+                toggle(63, "Word wrap", self.settings.word_wrap),
                 label(
                     58,
                     "Tab indents. Shift+Tab unindents. Ctrl+Tab switches documents.",
@@ -1185,13 +1200,14 @@ impl Application for Notes {
         if self.page == Page::Editor {
             self.paint_tabs(list);
             if let Some(area) = self.scene.bounds(EDITOR)
-                && let Some(tab) = self.current()
+                && let Some(id) = self.active.clone()
+                && let Some(tab) = self.tabs.get_mut(&id)
             {
                 let normal = tab.vim.as_ref().is_some_and(|v| !v.insert_mode());
                 self.metrics = paint::document(
                     list,
                     measure,
-                    &tab.doc,
+                    &mut tab.doc,
                     &self.settings,
                     area,
                     (self.focused, normal, &self.preedit),
@@ -1442,6 +1458,13 @@ impl Application for Notes {
                     55 => self.settings.auto_indent = value,
                     56 => self.settings.highlight_line = value,
                     57 => self.settings.show_whitespace = value,
+                    63 => {
+                        self.settings.word_wrap = value;
+                        for tab in self.tabs.values_mut() {
+                            tab.doc.scroll_row = 0;
+                            tab.doc.scroll_col = 0;
+                        }
+                    }
                     _ => {}
                 }
                 self.save();
@@ -1519,7 +1542,7 @@ impl Application for Notes {
                 self.focus_editor()?;
                 self.message = None;
                 self.preedit.clear();
-                if p[1] > area.y + area.height - 10.0 {
+                if !self.settings.word_wrap && p[1] > area.y + area.height - 10.0 {
                     self.horizontal_drag = true;
                     return Ok(true);
                 }
@@ -1596,11 +1619,14 @@ impl Application for Notes {
                 }
                 if self.scroll_drag {
                     let metrics = self.metrics;
+                    let width = self.settings.tab_width as usize;
                     if let Some(tab) = self.current_mut() {
                         let fraction =
                             ((p[1] - metrics.area.y) / metrics.area.height).clamp(0.0, 1.0);
                         tab.doc.scroll_row = (fraction
-                            * tab.doc.lines().saturating_sub(metrics.rows) as f32)
+                            * metrics
+                                .total_rows(&tab.doc, width)
+                                .saturating_sub(metrics.rows) as f32)
                             as usize;
                     }
                     return Ok(true);
@@ -1613,7 +1639,8 @@ impl Application for Notes {
                         if p[1] < metrics.area.y {
                             tab.doc.scroll_row = tab.doc.scroll_row.saturating_sub(1);
                         } else if p[1] > metrics.area.y + metrics.area.height {
-                            tab.doc.scroll_row = (tab.doc.scroll_row + 1).min(tab.doc.lines() - 1);
+                            tab.doc.scroll_row = (tab.doc.scroll_row + 1)
+                                .min(metrics.total_rows(&tab.doc, width).saturating_sub(1));
                         }
                         let byte = metrics.hit(&tab.doc, *p, width);
                         let anchor = tab.doc.anchor;
@@ -1662,7 +1689,7 @@ impl Application for Notes {
                     let horizontal = self.modifiers.shift_key();
                     let width = self.settings.tab_width as usize;
                     if let Some(tab) = self.current_mut() {
-                        if horizontal || delta[0] != 0.0 {
+                        if (horizontal || delta[0] != 0.0) && !metrics.wrap {
                             let amount = if delta[0] != 0.0 { delta[0] } else { delta[1] };
                             let longest = (tab.doc.scroll_row
                                 ..(tab.doc.scroll_row + metrics.rows).min(tab.doc.lines()))
@@ -1684,7 +1711,11 @@ impl Application for Notes {
                                 } else {
                                     step
                                 })
-                                .min(tab.doc.lines().saturating_sub(metrics.rows));
+                                .min(
+                                    metrics
+                                        .total_rows(&tab.doc, width)
+                                        .saturating_sub(metrics.rows),
+                                );
                         }
                     }
                     return Ok(true);
@@ -1995,6 +2026,7 @@ impl Application for Notes {
             self.sync_vim(result)?;
             return Ok(true);
         }
+        let metrics = self.metrics;
         let doc = &mut self.current_mut().unwrap().doc;
         match key {
             NativeKey::Named(n) => match n {
@@ -2004,10 +2036,10 @@ impl Application for Notes {
                 NamedKey::Delete => doc.delete(true, control, &settings),
                 NamedKey::ArrowLeft => doc.horizontal(false, control, shift),
                 NamedKey::ArrowRight => doc.horizontal(true, control, shift),
-                NamedKey::ArrowUp => doc.vertical(-1, shift, settings.tab_width as usize),
-                NamedKey::ArrowDown => doc.vertical(1, shift, settings.tab_width as usize),
-                NamedKey::PageUp => doc.vertical(-rows, shift, settings.tab_width as usize),
-                NamedKey::PageDown => doc.vertical(rows, shift, settings.tab_width as usize),
+                NamedKey::ArrowUp => metrics.vertical(doc, -1, shift, settings.tab_width as usize),
+                NamedKey::ArrowDown => metrics.vertical(doc, 1, shift, settings.tab_width as usize),
+                NamedKey::PageUp => metrics.vertical(doc, -rows, shift, settings.tab_width as usize),
+                NamedKey::PageDown => metrics.vertical(doc, rows, shift, settings.tab_width as usize),
                 NamedKey::Home => doc.home(false, control, shift),
                 NamedKey::End => doc.home(true, control, shift),
                 NamedKey::Insert => doc.overwrite = !doc.overwrite,
