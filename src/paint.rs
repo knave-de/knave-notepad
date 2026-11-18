@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn wrapping_preserves_words_and_maps_caret_and_hits() {
-        let mut doc = Document::new("hello world abcdefghijk\n\t界é".into());
+        let mut doc = Document::new("hello world abcdefghijk\n\t界é");
         let metrics = Metrics {
             wrap: true,
             cols: 8,

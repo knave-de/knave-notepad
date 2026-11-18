@@ -2,10 +2,11 @@
 Type=Application
 Name=Notes
 Comment=Write notes and find them again
-Exec=knave-notepad
+Exec=knave-notepad %F
 Icon=knave-notepad
 Terminal=false
 Categories=Utility;TextEditor;
+MimeType=text/plain;text/markdown;text/x-shellscript;text/x-python;application/json;application/toml;application/xml;
 Keywords=notepad;text;editor;
 StartupNotify=true
 StartupWMClass=knave-notepad

@@ -1,14 +1,27 @@
 use crate::{
     AppResult,
     editor::{Document, columns},
+    file_document::{FileDocument, SaveError},
     host::Application,
+    library_preview::{Preview, Previews},
     paint::{self, Metrics},
-    store::{Note, Notebook, Settings, Storage, now},
+    recovery::{Recovery, Snapshot},
+    store::{LibraryFile, Note, Notebook, Settings, Storage, now},
     vim::VimEditor,
 };
+mod files;
+mod window;
+
 use crossterm::event::{KeyCode, KeyModifiers as ModalModifiers};
 use knave_ui::{DisplayList, Rect, TextAlign, toolkit::*};
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    rc::Rc,
+    time::{Duration, Instant},
+};
+use window::{ViewPosition, WindowView};
 use winit::keyboard::{Key as NativeKey, ModifiersState, NamedKey};
 
 const EDITOR: ElementId = ElementId(20);
@@ -18,6 +31,8 @@ const SEARCH: ElementId = ElementId(30);
 const FIND: ElementId = ElementId(70);
 const REPLACE: ElementId = ElementId(71);
 const PAGE_SIZE: usize = 60;
+const LIBRARY_TAB_WIDTH: f32 = 112.0;
+const DOCUMENT_TAB_BASE: u64 = 200_000;
 #[derive(Clone, Copy, Default, PartialEq)]
 enum OverviewSort {
     #[default]
@@ -40,49 +55,33 @@ struct TabHit {
     id: String,
     rect: Rect,
     close: Rect,
+    bookmark: Option<Rect>,
 }
+enum FilePrompt {
+    Close(String),
+    CloseWindow(Vec<String>),
+    Conflict(String),
+}
+
 pub struct Notes {
-    scene: Scene,
     storage: Storage,
+    view: WindowView,
+    window: u64,
+    windows: HashMap<u64, WindowView>,
+    generation: u64,
+    shared_text: HashMap<String, (u64, String)>,
     book: Notebook,
+    previews: Previews,
     settings: Settings,
-    page: Page,
-    settings_return: Option<Page>,
-    active: Option<String>,
     tabs: HashMap<String, Tab>,
+    files: HashMap<String, FileDocument>,
+    recovery: Option<Recovery>,
+    recovery_after_crash: bool,
+    recoverable: VecDeque<(String, Snapshot)>,
+    checkpoints: HashMap<String, Instant>,
     modal_store:
         Rc<RefCell<modalkit::editing::store::Store<modalkit::editing::application::EmptyInfo>>>,
-    size: [f32; 2],
-    query: String,
-    results: Vec<String>,
-    overview_page: usize,
-    overview_sort: OverviewSort,
-    metrics: Metrics,
-    focused: bool,
-    dragging: bool,
-    gutter_drag: bool,
-    scroll_drag: bool,
-    horizontal_drag: bool,
-    pointer: [f32; 2],
-    modifiers: ModifiersState,
-    last_click: Option<(Instant, [f32; 2], u8)>,
-    tab_scroll: f32,
-    tab_hits: Vec<TabHit>,
-    tab_drag: Option<(String, f32)>,
-    reveal_tab: bool,
     save_error: Option<String>,
-    message: Option<String>,
-    effects: Vec<Action>,
-    preedit: String,
-    find_open: bool,
-    find_query: String,
-    replacement: String,
-    command_open: bool,
-    command: String,
-    search_backwards: bool,
-    pending_delete: Option<String>,
-    rename_note: Option<String>,
-    rename_text: String,
 }
 trait Enabled {
     fn enabled(self, value: bool) -> Self;
@@ -111,6 +110,85 @@ fn compact(id: u64, value: impl Into<String>) -> Element {
     e.layout.width = Length::Px(34.0);
     e
 }
+fn icon_button(id: u64, asset: &str, name: &str) -> Element {
+    let icon = TablerIcon::named(asset, IconVariant::Outline).expect("bundled Notepad icon");
+    let mut button = Element::tabler_button(id, 91_000 + id, icon, name);
+    button.layout.width = Length::Px(34.0);
+    button.layout.height = Length::Px(34.0);
+    button
+}
+
+fn paint_icon(
+    list: &mut DisplayList,
+    name: &str,
+    variant: IconVariant,
+    bounds: Rect,
+    color: knave_ui::Color,
+    clip: Rect,
+) {
+    let icon = TablerIcon::named(name, variant).expect("bundled Notepad icon");
+    list.commands.push(knave_ui::DisplayCommand::Image {
+        bounds,
+        image: icon.image(color),
+        style: knave_ui::ImageStyle::default(),
+        transform: knave_ui::Transform2D::IDENTITY,
+        clip: Some(clip),
+    });
+}
+
+fn overflow_menu(id: u64, icon_id: u64, name: &str, items: Vec<MenuItem>) -> Element {
+    let icon = TablerIcon::named("dots", IconVariant::Outline).unwrap();
+    let mut menu = Element::new(
+        id,
+        Widget::Menu {
+            label: String::new(),
+            items,
+        },
+    )
+    .layout(Layout {
+        flow: Flow::Overlay,
+        align: Align::Center,
+        width: Length::Px(34.0),
+        height: Length::Px(34.0),
+        ..Default::default()
+    })
+    .children(vec![icon.element(icon_id)]);
+    menu.semantics.name = Some(name.into());
+    menu.tooltip = Some(name.into());
+    menu
+}
+
+fn file_dialog(message: String, choices: &[(u64, &str)]) -> Element {
+    let mut message = label(101, message);
+    message.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
+    message.layout.height = Length::Fill;
+    let actions = choices
+        .iter()
+        .map(|&(id, title)| {
+            let mut button = button(id, title);
+            button.layout.width = Length::Fill;
+            button
+        })
+        .collect();
+    Element::new(100, Widget::Popup { modal: true })
+        .children(vec![
+            message,
+            row(109, actions).layout(Layout {
+                flow: Flow::Row,
+                height: Length::Px(34.0),
+                gap: 6.0,
+                ..Default::default()
+            }),
+        ])
+        .layout(Layout {
+            width: Length::Px(572.0),
+            height: Length::Px(180.0),
+            padding: 16.0,
+            gap: 12.0,
+            ..Default::default()
+        })
+}
+
 fn row(id: u64, children: Vec<Element>) -> Element {
     let mut e = Element::new(id, Widget::Panel)
         .layout(Layout {
@@ -184,54 +262,172 @@ fn stepper(
 }
 impl Notes {
     pub fn new(storage: Storage) -> AppResult<Self> {
-        let (book, settings) = storage.load()?;
+        let (book, settings) = storage.load_library()?;
         let mut app = Self {
-            scene: Scene::new(panel(0, vec![]))?,
             storage,
+            view: WindowView::new()?,
+            window: 0,
+            windows: HashMap::new(),
+            generation: 0,
+            shared_text: HashMap::new(),
             book,
+            previews: Previews::default(),
             settings,
-            page: Page::Overview,
-            settings_return: None,
-            active: None,
             tabs: HashMap::new(),
+            files: HashMap::new(),
+            recovery: None,
+            recovery_after_crash: false,
+            recoverable: VecDeque::new(),
+            checkpoints: HashMap::new(),
             modal_store: Rc::new(RefCell::new(Default::default())),
-            size: [1000.0, 720.0],
-            query: String::new(),
-            results: vec![],
-            overview_page: 0,
-            overview_sort: OverviewSort::default(),
-            metrics: Metrics::default(),
-            focused: false,
-            dragging: false,
-            gutter_drag: false,
-            scroll_drag: false,
-            horizontal_drag: false,
-            pointer: [0.0; 2],
-            modifiers: ModifiersState::empty(),
-            last_click: None,
-            tab_scroll: 0.0,
-            tab_hits: vec![],
-            tab_drag: None,
-            reveal_tab: true,
             save_error: None,
-            message: None,
-            effects: vec![],
-            preedit: String::new(),
-            find_open: false,
-            find_query: String::new(),
-            replacement: String::new(),
-            command_open: false,
-            command: String::new(),
-            search_backwards: false,
-            pending_delete: None,
-            rename_note: None,
-            rename_text: String::new(),
         };
+        app.previews.start(&app.book.files);
         app.save();
         app.rebuild()?;
         Ok(app)
     }
+    fn elsewhere(&self, id: &str) -> bool {
+        self.windows
+            .values()
+            .any(|view| view.tab_order.iter().any(|tab| tab == id))
+    }
+
+    fn share_text(&mut self, id: &str) {
+        if self.elsewhere(id)
+            && let Some(tab) = self.tabs.get(id)
+        {
+            self.shared_text
+                .entry(id.to_owned())
+                .or_insert_with(|| (tab.doc.revision, tab.doc.text.clone()));
+        }
+    }
+
+    fn update_shared_views(&mut self, id: &str) {
+        let Some((revision, previous)) = self.shared_text.get_mut(id) else {
+            return;
+        };
+        let doc = &self.tabs[id].doc;
+        if *revision == doc.revision && *previous == doc.text {
+            return;
+        }
+        *revision = doc.revision;
+        let prefix = previous
+            .chars()
+            .zip(doc.text.chars())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum::<usize>();
+        let suffix = previous[prefix..]
+            .chars()
+            .rev()
+            .zip(doc.text[prefix..].chars().rev())
+            .take_while(|(a, b)| a == b)
+            .map(|(c, _)| c.len_utf8())
+            .sum::<usize>();
+        let old_end = previous.len() - suffix;
+        let new_end = doc.text.len() - suffix;
+        let adjust = |position: usize| {
+            if position <= prefix {
+                position
+            } else if position >= old_end {
+                new_end + position - old_end
+            } else {
+                new_end
+            }
+        };
+        let row = previous[..prefix]
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count();
+        let old_end_row = row
+            + previous[prefix..old_end]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+        let new_end_row = row
+            + doc.text[prefix..new_end]
+                .bytes()
+                .filter(|&byte| byte == b'\n')
+                .count();
+        for view in self.windows.values_mut() {
+            if let Some(position) = view.positions.get_mut(id) {
+                position.cursor = adjust(position.cursor);
+                position.anchor = adjust(position.anchor);
+                if position.scroll_row > row {
+                    position.scroll_row =
+                        new_end_row + position.scroll_row.saturating_sub(old_end_row);
+                }
+            }
+        }
+        previous.clone_from(&doc.text);
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn switch_window(&mut self, id: u64) -> AppResult {
+        if self.window == id {
+            return Ok(());
+        }
+        let mut next = match self.windows.remove(&id) {
+            Some(view) => view,
+            None => {
+                let mut view = WindowView::new()?;
+                view.scene
+                    .set_theme(self.view.scene.theme_policy().scheme)?;
+                view
+            }
+        };
+        let positions = self
+            .book
+            .tabs
+            .iter()
+            .filter_map(|id| {
+                self.tabs
+                    .get(id)
+                    .map(|tab| (id.clone(), ViewPosition::capture(&tab.doc)))
+            })
+            .collect();
+        let next_positions = std::mem::take(&mut next.positions);
+        std::mem::swap(&mut self.book.tabs, &mut next.tab_order);
+        let mut previous = std::mem::replace(&mut self.view, next);
+        previous.positions = positions;
+        previous.tab_order = std::mem::take(&mut self.view.tab_order);
+        self.windows.insert(self.window, previous);
+        self.window = id;
+        for tab_id in &self.book.tabs {
+            if let Some(tab) = self.tabs.get_mut(tab_id) {
+                next_positions
+                    .get(tab_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .restore(tab);
+            }
+        }
+        if self.view.seen_generation != self.generation
+            || self.view.scene.widget(ElementId(2)).is_none()
+        {
+            self.view.seen_generation = self.generation;
+            self.rebuild()?;
+        }
+        Ok(())
+    }
+
+    fn forget_window(&mut self, id: u64) {
+        if let Some(view) = self.windows.remove(&id) {
+            for tab in view.tab_order {
+                if !self.book.tabs.contains(&tab) && !self.elsewhere(&tab) {
+                    self.tabs.remove(&tab);
+                    self.files.remove(&tab);
+                    self.shared_text.remove(&tab);
+                    self.checkpoints.remove(&tab);
+                }
+            }
+        }
+    }
+
     fn save(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.view.seen_generation = self.generation;
         self.save_error = self
             .storage
             .save(&self.book, &self.settings)
@@ -239,23 +435,32 @@ impl Notes {
             .map(|e| format!("Save failed: {e}. Retry with Ctrl+S."));
     }
     fn current(&self) -> Option<&Tab> {
-        self.active.as_ref().and_then(|id| self.tabs.get(id))
+        self.view.active.as_ref().and_then(|id| self.tabs.get(id))
     }
     fn current_mut(&mut self) -> Option<&mut Tab> {
-        self.active.as_ref().and_then(|id| self.tabs.get_mut(id))
+        self.view
+            .active
+            .as_ref()
+            .and_then(|id| self.tabs.get_mut(id))
     }
     fn status(&self) -> String {
         if let Some(error) = &self.save_error {
             return error.clone();
         }
-        if let Some(message) = &self.message {
+        if let Some(message) = &self.view.message {
             return message.clone();
         }
-        if self.page != Page::Editor {
-            return format!("{} documents", self.book.notes.len());
+        if self.view.page != Page::Editor {
+            let count = self.book.notes.len() + self.book.files.len();
+            return if count == 1 {
+                "1 document".into()
+            } else {
+                format!("{count} documents")
+            };
         }
         if let Some(tab) = self.current() {
             let doc = &tab.doc;
+            let file = self.view.active.as_ref().and_then(|id| self.files.get(id));
             let mode = tab
                 .vim
                 .as_ref()
@@ -266,20 +471,30 @@ impl Notes {
             } else {
                 "Tabs"
             };
+            let path = file
+                .map(|file| format!("    {}", file.path.display()))
+                .unwrap_or_default();
             let selected = if doc.selection().is_empty() {
                 String::new()
             } else {
                 format!(" · {} selected", doc.selected().chars().count())
             };
             format!(
-                "{}    UTF-8 · LF    {indent}: {}    Ln {}, Col {}{selected}    {mode}",
-                if doc.text.is_empty() {
+                "{}    UTF-8 · {}    {indent}: {}    Ln {}, Col {}{selected}    {mode}{path}",
+                if let Some(file) = file {
+                    if file.dirty(&doc.text) {
+                        "Modified"
+                    } else {
+                        "Saved"
+                    }
+                } else if doc.text.is_empty() {
                     "Empty note"
                 } else if self.save_error.is_none() {
                     "Saved"
                 } else {
                     "Unsaved"
                 },
+                file.map_or("LF", FileDocument::line_endings),
                 self.settings.tab_width,
                 doc.row() + 1,
                 doc.column(self.settings.tab_width as usize) + 1
@@ -289,9 +504,10 @@ impl Notes {
         }
     }
     fn refresh_status(&mut self) -> AppResult {
-        self.scene.set_text(STATUS, self.status())?;
-        if self.scene.widget(ElementId(61)).is_some() {
-            self.scene
+        self.view.scene.set_text(STATUS, self.status())?;
+        if self.view.scene.widget(ElementId(61)).is_some() {
+            self.view
+                .scene
                 .set_visible(ElementId(61), self.save_error.is_some())?;
         }
         Ok(())
@@ -301,9 +517,10 @@ impl Notes {
             let note = self
                 .book
                 .notes
-                .iter()
+                .iter_mut()
                 .find(|n| n.id == id)
                 .ok_or("Missing note")?;
+            self.storage.materialize(note)?;
             let doc = Document::new(&note.text);
             let vim = self
                 .settings
@@ -314,28 +531,37 @@ impl Notes {
         Ok(())
     }
     fn leave_settings(&mut self) -> AppResult {
-        self.page = self.settings_return.take().unwrap_or(Page::Overview);
+        self.view.page = self.view.settings_return.take().unwrap_or(Page::Overview);
         self.rebuild()?;
-        if self.page == Page::Editor {
+        if self.view.page == Page::Editor {
             self.focus_editor()?;
         }
         Ok(())
     }
     fn focus_editor(&mut self) -> AppResult {
-        self.focused = true;
-        self.scene.set_focus(Some(EDITOR))?;
+        self.view.focused = true;
+        self.view.scene.set_focus(Some(EDITOR))?;
         Ok(())
     }
     fn open(&mut self, id: String) -> AppResult {
-        self.ensure_tab(&id)?;
-        if !self.book.tabs.contains(&id) {
-            self.book.tabs.push(id.clone());
+        if let Err(error) = self.ensure_tab(&id) {
+            self.view.message = Some(format!("Could not open note: {error}"));
+            return self.refresh_status();
         }
-        self.active = Some(id);
-        self.page = Page::Editor;
-        self.message = None;
-        self.reveal_tab = true;
-        self.preedit.clear();
+        if !self.book.tabs.contains(&id) {
+            if self.elsewhere(&id)
+                && let Some(tab) = self.tabs.get_mut(&id)
+            {
+                ViewPosition::default().restore(tab);
+            }
+            self.book.tabs.push(id.clone());
+            self.share_text(&id);
+        }
+        self.view.active = Some(id);
+        self.view.page = Page::Editor;
+        self.view.message = None;
+        self.view.reveal_tab = true;
+        self.view.preedit.clear();
         self.save();
         self.rebuild()?;
         self.focus_editor()
@@ -347,11 +573,31 @@ impl Notes {
         self.open(id)
     }
     fn close(&mut self, id: &str) -> AppResult {
+        if !self.elsewhere(id)
+            && self
+                .files
+                .get(id)
+                .is_some_and(|file| file.dirty(&self.tabs[id].doc.text))
+        {
+            self.view.file_prompt = Some(FilePrompt::Close(id.into()));
+            return self.rebuild();
+        }
+        self.remove_tab(id)
+    }
+
+    fn remove_tab(&mut self, id: &str) -> AppResult {
+        if !self.elsewhere(id) {
+            if self.files.contains_key(id) && !self.clear_recovery(id)? {
+                return Ok(());
+            }
+            self.files.remove(id);
+            self.tabs.remove(id);
+            self.shared_text.remove(id);
+        }
         let index = self.book.tabs.iter().position(|t| t == id).unwrap_or(0);
         self.book.tabs.retain(|t| t != id);
-        self.tabs.remove(id);
-        if self.active.as_deref() == Some(id) {
-            self.active = None;
+        if self.view.active.as_deref() == Some(id) {
+            self.view.active = None;
             if let Some(next) = self
                 .book
                 .tabs
@@ -360,27 +606,44 @@ impl Notes {
             {
                 return self.open(next);
             }
-            self.page = Page::Overview;
-            self.focused = false;
+            self.view.page = Page::Overview;
+            self.view.focused = false;
         }
         self.save();
         self.rebuild()
     }
     fn changed(&mut self) -> AppResult {
+        if let Some(id) = self.view.active.clone() {
+            self.update_shared_views(&id);
+        }
+        if let Some(id) = &self.view.active
+            && self.recovery.is_some()
+            && self.files.contains_key(id)
+        {
+            self.checkpoints
+                .entry(id.clone())
+                .or_insert_with(|| Instant::now() + Duration::from_millis(500));
+        }
         let mut changed = false;
-        if let Some(id) = &self.active
+        let mut title_changed = false;
+        if let Some(id) = &self.view.active
             && let Some(tab) = self.tabs.get(id)
             && let Some(note) = self.book.notes.iter_mut().find(|n| &n.id == id)
             && note.text != tab.doc.text
         {
-            note.text = tab.doc.text.clone();
+            let previous_title = note.title();
+            note.text.clone_from(&tab.doc.text);
             note.updated = now();
+            title_changed = note.title() != previous_title;
             changed = true;
         }
         if changed {
             self.save();
+            if title_changed {
+                self.rebuild()?;
+            }
         }
-        let metrics = self.metrics;
+        let metrics = self.view.metrics;
         let width = self.settings.tab_width as usize;
         if let Some(tab) = self.current_mut() {
             metrics.reveal(&mut tab.doc, width);
@@ -388,7 +651,7 @@ impl Notes {
         self.refresh_status()
     }
     fn sync_vim(&mut self, result: Result<(), String>) -> AppResult {
-        self.message = result.err();
+        self.view.message = result.err();
         if let Some(tab) = self.current_mut()
             && let Some(vim) = &mut tab.vim
         {
@@ -414,7 +677,7 @@ impl Notes {
             None
         };
         if let Some(error) = error {
-            self.message = Some(format!("Could not apply modal edit: {error}"));
+            self.view.message = Some(format!("Could not apply modal edit: {error}"));
         }
     }
     fn switch_tab(&mut self, delta: isize) -> AppResult {
@@ -422,6 +685,7 @@ impl Notes {
             return Ok(());
         }
         let index = self
+            .view
             .active
             .as_ref()
             .and_then(|id| self.book.tabs.iter().position(|t| t == id))
@@ -430,11 +694,11 @@ impl Notes {
         self.open(self.book.tabs[index].clone())
     }
     fn find(&mut self, backwards: bool) -> AppResult {
-        let query = self.find_query.clone();
+        let query = self.view.find_query.clone();
         let found = self
             .current_mut()
             .is_some_and(|tab| tab.doc.find(&query, backwards));
-        self.message = (!found).then(|| "No match".into());
+        self.view.message = (!found).then(|| "No match".into());
         if found
             && let Some(tab) = self.current_mut()
             && let Some(vim) = &mut tab.vim
@@ -445,7 +709,7 @@ impl Notes {
     }
     fn import(&mut self) -> AppResult {
         let Some(path) = rfd::FileDialog::new()
-            .set_title("Open text document")
+            .set_title("Import as Note")
             .pick_file()
         else {
             return Ok(());
@@ -455,27 +719,32 @@ impl Notes {
                 let mut note = Note::new();
                 note.text = crate::editor::normalize(&text);
                 note.name = path.file_name().map(|s| s.to_string_lossy().into_owned());
+                note.keep_empty = true;
                 let id = note.id.clone();
                 self.book.notes.push(note);
                 self.open(id)?;
             }
             Err(error) => {
-                self.message = Some(format!("Could not open document: {error}"));
+                self.view.message = Some(format!("Could not open document: {error}"));
                 self.refresh_status()?;
             }
         }
         Ok(())
     }
     fn export(&mut self) -> AppResult {
-        let Some(id) = &self.active else {
+        let Some(id) = &self.view.active else {
             return Ok(());
         };
         self.export_note(&id.clone())
     }
     fn export_note(&mut self, id: &str) -> AppResult {
-        let Some(note) = self.book.notes.iter().find(|n| n.id == id) else {
+        let Some(note) = self.book.notes.iter_mut().find(|n| n.id == id) else {
             return Ok(());
         };
+        if let Err(error) = self.storage.materialize(note) {
+            self.view.message = Some(format!("Cannot export note: {error}"));
+            return self.refresh_status();
+        }
         let Some(path) = rfd::FileDialog::new()
             .set_title("Export text document")
             .set_file_name(format!("{}.txt", note.title()))
@@ -483,19 +752,23 @@ impl Notes {
         else {
             return Ok(());
         };
-        match crate::store::export_text(&path, &note.text) {
-            Ok(()) => self.message = Some(format!("Exported to {}", path.display())),
-            Err(e) => self.message = Some(format!("Export failed: {e}")),
+        match FileDocument::export(&path, &note.text) {
+            Ok(()) => self.view.message = Some(format!("Exported to {}", path.display())),
+            Err(e) => self.view.message = Some(format!("Export failed: {e}")),
         };
         self.refresh_status()
     }
     fn finish_rename(&mut self) -> AppResult {
-        let name = self.rename_text.trim();
+        let name = self.view.rename_text.trim();
         if name.is_empty() {
             return Ok(());
         }
-        if let Some(id) = self.rename_note.take() {
+        if let Some(id) = self.view.rename_note.take() {
             if let Some(note) = self.book.notes.iter_mut().find(|n| n.id == id) {
+                if let Err(error) = self.storage.materialize(note) {
+                    self.view.message = Some(format!("Cannot rename note: {error}"));
+                    return self.rebuild();
+                }
                 note.name = Some(name.to_string());
                 note.updated = now();
             }
@@ -507,37 +780,43 @@ impl Notes {
         self.book.notes.retain(|note| note.id != id);
         self.book.tabs.retain(|tab| tab != id);
         self.tabs.remove(id);
-        if self.active.as_deref() == Some(id) {
-            self.active = None;
+        if self.view.active.as_deref() == Some(id) {
+            self.view.active = None;
         }
         self.save();
         self.rebuild()
     }
     fn command(&mut self) -> AppResult {
-        let command = self.command.trim().trim_start_matches(':').to_owned();
-        self.command_open = false;
-        self.command.clear();
+        let command = self.view.command.trim().trim_start_matches(':').to_owned();
+        self.view.command_open = false;
+        self.view.command.clear();
         self.rebuild()?;
         self.focus_editor()?;
         match command.as_str() {
             "w" => {
-                self.save();
-                self.refresh_status()?;
+                self.save_current()?;
             }
             "q" => {
-                if let Some(id) = self.active.clone() {
+                if let Some(id) = self.view.active.clone() {
                     self.close(&id)?;
                 }
             }
             "wq" | "x" => {
-                self.save();
-                if self.save_error.is_none()
-                    && let Some(id) = self.active.clone()
-                {
-                    self.close(&id)?;
+                if let Some(id) = self.view.active.clone() {
+                    if self.save_current()? {
+                        self.close(&id)?;
+                    } else if matches!(self.view.file_prompt, Some(FilePrompt::Conflict(_))) {
+                        self.view.close_after_save = Some(id);
+                    }
                 }
             }
-            "e" => self.import()?,
+            "e" => self.pick_file()?,
+            command if command.starts_with("e ") => {
+                if let Err(error) = self.open_file(Path::new(command[2..].trim())) {
+                    self.view.message = Some(format!("Open failed: {error}"));
+                    self.refresh_status()?;
+                }
+            }
             c if c.starts_with("set ") => {
                 let mut error = None;
                 for option in c[4..].split_whitespace() {
@@ -565,7 +844,7 @@ impl Notes {
                         _ => error = Some(format!("Unknown setting: {option}")),
                     }
                 }
-                self.message = error;
+                self.view.message = error;
                 self.save();
                 self.refresh_status()?;
             }
@@ -581,39 +860,167 @@ impl Notes {
                 self.changed()?;
             }
             _ => {
-                self.message = Some(format!("Unknown command: {command}"));
+                self.view.message = Some(format!("Unknown command: {command}"));
                 self.refresh_status()?;
             }
         }
         Ok(())
     }
+    fn document_tab_title(&self, id: &str) -> String {
+        self.files.get(id).map_or_else(
+            || {
+                self.book
+                    .notes
+                    .iter()
+                    .find(|note| note.id == id)
+                    .map(Note::title)
+                    .unwrap_or_default()
+            },
+            |file| {
+                file.path
+                    .file_name()
+                    .unwrap_or(file.path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned()
+            },
+        )
+    }
+
+    fn tab_width(&self, strip_width: f32) -> f32 {
+        (strip_width / self.book.tabs.len().max(1) as f32).clamp(155.0, 280.0)
+    }
+
+    fn tab_controls(&mut self) -> Element {
+        let extent = (self.view.size[0] - LIBRARY_TAB_WIDTH).max(0.0);
+        let width = self.tab_width(extent);
+        if self.view.reveal_tab {
+            if let Some(index) = self
+                .view
+                .active
+                .as_ref()
+                .and_then(|id| self.book.tabs.iter().position(|tab| tab == id))
+            {
+                let left = index as f32 * width;
+                self.view.tab_scroll = self
+                    .view
+                    .tab_scroll
+                    .clamp((left + width - extent).min(left), left);
+            }
+            self.view.reveal_tab = false;
+        }
+        self.view.tab_scroll = self
+            .view
+            .tab_scroll
+            .clamp(0.0, (width * self.book.tabs.len() as f32 - extent).max(0.0));
+        let first = (self.view.tab_scroll / width).floor() as usize;
+        let visible = (extent / width).ceil() as usize + 1;
+        let children = self
+            .book
+            .tabs
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(visible)
+            .flat_map(|(index, id)| {
+                let left = index as f32 * width - self.view.tab_scroll;
+                let base = DOCUMENT_TAB_BASE + index as u64 * 3;
+                let file = self.files.get(id);
+                let mut tab = button(base, "");
+                let title = self.document_tab_title(id);
+                tab.semantics.name = Some(title.clone());
+                tab.semantics.role = Some(Role::Tab);
+                tab.semantics.current =
+                    self.view.page == Page::Editor && self.view.active.as_ref() == Some(id);
+                tab.tooltip = Some(
+                    self.files
+                        .get(id)
+                        .map_or_else(|| title.clone(), |file| file.path.display().to_string()),
+                );
+                tab.paint_surface = false;
+                tab.layout.width = Length::Px(width - if file.is_some() { 53.0 } else { 29.0 });
+                tab.layout.height = Length::Px(38.0);
+                tab.layout.offset = [left, 0.0];
+
+                let mut close = button(base + 1, "");
+                close.semantics.name = Some(format!("Close {title}"));
+                close.tooltip = Some("Close tab".into());
+                close.paint_surface = false;
+                close.layout.width = Length::Px(24.0);
+                close.layout.height = Length::Px(26.0);
+                close.layout.offset = [left + width - 29.0, 6.0];
+                let bookmark = file.map(|file| {
+                    let action = if self.bookmark_index(file).is_some() {
+                        "Remove from Library"
+                    } else {
+                        "Add to Library"
+                    };
+                    let mut bookmark = button(base + 2, "");
+                    bookmark.semantics.name = Some(action.into());
+                    bookmark.tooltip = Some(action.into());
+                    bookmark.paint_surface = false;
+                    bookmark.layout.width = Length::Px(24.0);
+                    bookmark.layout.height = Length::Px(26.0);
+                    bookmark.layout.offset = [left + width - 53.0, 6.0];
+                    bookmark
+                });
+                [Some(tab), Some(close), bookmark].into_iter().flatten()
+            })
+            .collect();
+        let mut strip = panel(STRIP.0, children).layout(Layout {
+            flow: Flow::Overlay,
+            align: Align::Start,
+            height: Length::Px(38.0),
+            gap: 0.0,
+            ..Default::default()
+        });
+        strip.paint_surface = false;
+        strip
+    }
+
     fn rebuild(&mut self) -> AppResult {
         // Keep the active blank buffer editable (including undo), but discard
         // empty drafts as soon as the user leaves them.
-        let keep = if self.page == Page::Editor
-            || (self.page == Page::Settings && self.settings_return == Some(Page::Editor))
+        let keep = if self.view.page == Page::Editor
+            || (self.view.page == Page::Settings && self.view.settings_return == Some(Page::Editor))
         {
-            self.active.as_deref()
+            self.view.active.as_deref()
         } else {
             None
         };
-        self.book
-            .notes
-            .retain(|note| !note.text.is_empty() || Some(note.id.as_str()) == keep);
-        self.book
-            .tabs
-            .retain(|id| self.book.notes.iter().any(|note| &note.id == id));
-        self.tabs
-            .retain(|id, _| self.book.notes.iter().any(|note| &note.id == id));
-        if self
+        let inactive_active: Vec<_> = self
+            .windows
+            .values()
+            .filter_map(|view| view.active.as_deref())
+            .collect();
+        self.book.notes.retain(|note| {
+            note.retained()
+                || Some(note.id.as_str()) == keep
+                || inactive_active.contains(&note.id.as_str())
+        });
+        self.book.tabs.retain(|id| {
+            self.files.contains_key(id) || self.book.notes.iter().any(|note| &note.id == id)
+        });
+        self.tabs.retain(|id, _| {
+            self.files.contains_key(id) || self.book.notes.iter().any(|note| &note.id == id)
+        });
+        if self.view.active.as_ref().is_some_and(|id| {
+            !self.files.contains_key(id) && !self.book.notes.iter().any(|note| &note.id == id)
+        }) {
+            self.view.active = None;
+            if self.view.page == Page::Editor {
+                self.view.page = Page::Overview;
+                self.view.focused = false;
+            }
+        }
+        let editing = self.view.page == Page::Editor;
+        let file = self
+            .view
             .active
             .as_ref()
-            .is_some_and(|id| !self.book.notes.iter().any(|note| &note.id == id))
-        {
-            self.active = None;
-        }
-        let editing = self.page == Page::Editor;
-        let page_title = if self.page == Page::Settings {
+            .filter(|_| editing)
+            .and_then(|id| self.files.get(id));
+        let external = file.is_some();
+        let page_title = if self.view.page == Page::Settings {
             "Preferences"
         } else {
             ""
@@ -622,51 +1029,80 @@ impl Notes {
         title.style.text.align = TextAlign::Center;
         title.style.text.weight = 600;
         title.style.text.wrap = knave_ui::TextWrap::None;
-        let mut header = row(
-            1,
-            vec![
-                button(
+        let mut tools = Vec::new();
+        if self.view.page == Page::Settings {
+            tools.push(button(2, "Back"));
+        }
+        tools.extend([
+            icon_button(4, "plus", "New note"),
+            title,
+            icon_button(9, "folder-open", "Open File"),
+        ]);
+        if editing {
+            tools.push(icon_button(11, "search", "Find"));
+        }
+        if external {
+            tools.push(icon_button(12, "device-floppy", "Save"));
+        }
+        if self.view.page != Page::Settings {
+            let mut actions = vec![MenuItem::option(1, "Import as Note…")];
+            if editing {
+                actions.push(MenuItem::option(
                     2,
-                    if self.page == Page::Settings {
-                        "Back"
-                    } else if editing {
-                        "Library"
+                    if external {
+                        "Save As…"
                     } else {
-                        "Notes"
+                        "Export as File…"
                     },
-                ),
-                compact(4, "+"),
-                title,
-                button(9, "Open…"),
-                button(10, "Export…").enabled(editing),
-                button(11, "Find").enabled(editing),
-                button(5, "Settings"),
-            ],
-        )
-        .layout(Layout {
-            flow: Flow::Row,
-            height: Length::Px(46.0),
-            padding: 6.0,
-            gap: 6.0,
-            ..Default::default()
-        })
-        .class("header");
+                ));
+            }
+            tools.push(overflow_menu(16, 91_016, "More actions", actions));
+        }
+        tools.push(icon_button(5, "settings", "Settings"));
+        let mut header = row(1, tools)
+            .layout(Layout {
+                flow: Flow::Row,
+                height: Length::Px(46.0),
+                padding: 6.0,
+                gap: 6.0,
+                ..Default::default()
+            })
+            .class("header");
         header.paint_surface = true;
         header.layout.align = Align::Center;
         let mut body = vec![header];
-        if editing {
-            let mut strip = panel(STRIP.0, vec![]).layout(Layout {
+        if self.view.page != Page::Settings {
+            let strip = self.tab_controls();
+            let books = TablerIcon::named("books", IconVariant::Outline).unwrap();
+            let mut library =
+                button(15, "").children(vec![books.element(91_015), label(17, "Library")]);
+            library.layout.flow = Flow::Row;
+            library.layout.align = Align::Center;
+            library.layout.width = Length::Px(LIBRARY_TAB_WIDTH);
+            library.layout.height = Length::Px(38.0);
+            library.layout.gap = 4.0;
+            library.semantics.name = Some("Library".into());
+            library.semantics.role = Some(Role::Tab);
+            library.semantics.current = self.view.page == Page::Overview;
+            if self.view.page == Page::Overview {
+                library = library.class("library-active");
+            }
+            let mut tab_list = row(18, vec![library, strip]).layout(Layout {
+                flow: Flow::Row,
                 height: Length::Px(38.0),
+                gap: 0.0,
                 ..Default::default()
             });
-            strip.paint_surface = false;
-            body.push(strip);
-            if self.find_open {
+            tab_list.semantics.role = Some(Role::TabList);
+            body.push(tab_list);
+        }
+        if editing {
+            if self.view.find_open {
                 body.push(
                     row(
                         72,
                         vec![
-                            field(FIND.0, &self.find_query)?,
+                            field(FIND.0, &self.view.find_query)?,
                             compact(73, "↑"),
                             compact(74, "↓"),
                             compact(75, "×"),
@@ -684,7 +1120,7 @@ impl Notes {
                     row(
                         76,
                         vec![
-                            field(REPLACE.0, &self.replacement)?,
+                            field(REPLACE.0, &self.view.replacement)?,
                             button(77, "Replace"),
                             button(78, "Replace all"),
                         ],
@@ -698,7 +1134,7 @@ impl Notes {
                     }),
                 );
             }
-            if self.command_open {
+            if self.view.command_open {
                 body.push(
                     row(
                         81,
@@ -708,7 +1144,7 @@ impl Notes {
                                 e.layout.width = Length::Px(16.0);
                                 e
                             },
-                            field(80, &self.command)?,
+                            field(80, &self.view.command)?,
                         ],
                     )
                     .layout(Layout {
@@ -729,8 +1165,8 @@ impl Notes {
             surface.paint_surface = false;
             surface.cursor = Some(CursorShape::Text);
             body.push(surface);
-        } else if self.page == Page::Overview {
-            let mut search = field(SEARCH.0, &self.query)?;
+        } else if self.view.page == Page::Overview {
+            let mut search = field(SEARCH.0, &self.view.query)?;
             search.layout.width = Length::Px(260.0);
             search = search.class("library-search");
             let mut sort_label = label(54, "Sort by:");
@@ -738,7 +1174,7 @@ impl Notes {
             let mut sort_dropdown = Element::new(
                 56,
                 Widget::Dropdown {
-                    label: match self.overview_sort {
+                    label: match self.view.overview_sort {
                         OverviewSort::DateModified => "Date modified".into(),
                         OverviewSort::DateCreated => "Date created".into(),
                         OverviewSort::TitleAscending => "Title".into(),
@@ -748,7 +1184,7 @@ impl Notes {
                         MenuItem::option(2, "Date created"),
                         MenuItem::option(3, "Title"),
                     ],
-                    selected: Some(match self.overview_sort {
+                    selected: Some(match self.view.overview_sort {
                         OverviewSort::DateModified => 1,
                         OverviewSort::DateCreated => 2,
                         OverviewSort::TitleAscending => 3,
@@ -786,7 +1222,7 @@ impl Notes {
                     ..Default::default()
                 }),
             );
-            if let Some(id) = &self.pending_delete {
+            if let Some(id) = &self.view.pending_delete {
                 let title = self
                     .book
                     .notes
@@ -812,8 +1248,8 @@ impl Notes {
                 );
             }
 
-            if self.rename_note.is_some() {
-                let mut name = field(86, &self.rename_text)?;
+            if self.view.rename_note.is_some() {
+                let mut name = field(86, &self.view.rename_text)?;
                 name.layout.width = Length::Fill;
                 body.push(
                     Element::new(84, Widget::Popup { modal: true })
@@ -831,11 +1267,48 @@ impl Notes {
                         }),
                 );
             }
-            let query = self.query.to_lowercase();
+            let query = self.view.query.to_lowercase();
+            if !query.is_empty() {
+                for note in &mut self.book.notes {
+                    if let Err(error) = self.storage.materialize(note) {
+                        eprintln!("Note {} could not be searched: {error}", note.id);
+                    }
+                }
+            }
+            let external_cards: Vec<_> = self
+                .book
+                .files
+                .iter()
+                .map(|entry| {
+                    let (text, created, updated) = match self.previews.get(entry) {
+                        Some(Preview::Available {
+                            text,
+                            created,
+                            modified,
+                        }) => (text.as_str(), *created, *modified),
+                        Some(Preview::Missing) => ("File missing", entry.added, entry.added),
+                        Some(Preview::Unavailable) => {
+                            ("File unavailable", entry.added, entry.added)
+                        }
+                        None => ("", entry.added, entry.added),
+                    };
+                    let location = entry.path.parent().unwrap_or(&entry.path).display();
+                    Note {
+                        id: entry.id.clone(),
+                        text: format!("{location}\n{text}"),
+                        created,
+                        updated,
+                        name: Some(entry.title()),
+                        keep_empty: false,
+                        indexed_title: None,
+                    }
+                })
+                .collect();
             let mut notes: Vec<_> = self
                 .book
                 .notes
                 .iter()
+                .chain(external_cards.iter())
                 .filter_map(|note| {
                     let title = note.title();
                     let title_lower = title.to_lowercase();
@@ -845,7 +1318,7 @@ impl Notes {
                     matches.then_some((note, title_lower))
                 })
                 .collect();
-            notes.sort_by(|a, b| match self.overview_sort {
+            notes.sort_by(|a, b| match self.view.overview_sort {
                 OverviewSort::DateModified => {
                     b.0.updated
                         .cmp(&a.0.updated)
@@ -866,18 +1339,20 @@ impl Notes {
                 }
                 OverviewSort::TitleAscending => a.1.cmp(&b.1).then_with(|| a.0.id.cmp(&b.0.id)),
             });
-            self.results = notes.iter().map(|(note, _)| note.id.clone()).collect();
-            self.overview_page = self
+            self.view.results = notes.iter().map(|(note, _)| note.id.clone()).collect();
+            self.view.overview_page = self
+                .view
                 .overview_page
                 .min(notes.len().saturating_sub(1) / PAGE_SIZE);
-            let cols = ((self.size[0] - 32.0) / 220.0).floor().max(1.0) as usize;
+            let cols = ((self.view.size[0] - 32.0) / 220.0).floor().max(1.0) as usize;
             let cards = notes
                 .iter()
                 .enumerate()
-                .skip(self.overview_page * PAGE_SIZE)
+                .skip(self.view.overview_page * PAGE_SIZE)
                 .take(PAGE_SIZE)
                 .map(|(index, note)| {
                     let slot = (index % PAGE_SIZE) as u64;
+                    let external = self.book.files.iter().any(|entry| entry.id == note.0.id);
                     let mut cover =
                         button(1000 + slot, "")
                             .class("document-cover")
@@ -888,20 +1363,11 @@ impl Notes {
                                 align: Align::Center,
                                 ..Default::default()
                             });
-                    let excerpt = note
-                        .0
-                        .text
-                        .lines()
-                        .filter(|line| !line.trim().is_empty())
-                        .take(4)
-                        .map(|line| {
-                            line.chars()
-                                .take(100)
-                                .collect::<String>()
-                                .replace('\t', "    ")
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let mut excerpt: String = note.0.text.chars().take(512).collect();
+                    if excerpt.len() < note.0.text.len() {
+                        excerpt.push('…');
+                    }
+                    let excerpt = excerpt.replace('\t', "    ");
                     let mut preview = label(10000 + slot, excerpt).class("document-preview");
                     preview.layout = Layout {
                         width: Length::Fill,
@@ -909,31 +1375,40 @@ impl Notes {
                         padding: 1.0,
                         ..Default::default()
                     };
+                    preview.ellipsize = true;
                     preview.style.text.align = TextAlign::Start;
                     preview.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
 
                     let mut title = label(6000 + slot, note.0.title()).class("document-title");
                     title.layout.height = Length::Px(32.0);
                     title.layout.width = Length::Fill;
+                    title.ellipsize = true;
                     title.style.text.wrap = knave_ui::TextWrap::WordOrGlyph;
-                    let menu = Element::new(
+                    let mut menu = overflow_menu(
                         2000 + slot,
-                        Widget::Menu {
-                            label: "⋯".into(),
-                            items: vec![
+                        93_000 + slot,
+                        if external {
+                            "File actions"
+                        } else {
+                            "Note actions"
+                        },
+                        if external {
+                            vec![
+                                MenuItem::option(5, "Locate File…"),
+                                MenuItem::option(4, "Remove from Library"),
+                            ]
+                        } else {
+                            vec![
                                 MenuItem::option(1, "Rename…"),
-                                MenuItem::option(2, "Export…"),
+                                MenuItem::option(2, "Export as File…"),
                                 MenuItem::Separator,
                                 MenuItem::option(3, "Delete…"),
-                            ],
+                            ]
                         },
                     )
-                    .class("document-menu")
-                    .layout(Layout {
-                        width: Length::Px(32.0),
-                        height: Length::Px(30.0),
-                        ..Default::default()
-                    });
+                    .class("document-menu");
+                    menu.layout.width = Length::Px(32.0);
+                    menu.layout.height = Length::Px(30.0);
                     let age = now().saturating_sub(note.0.updated) / 1000;
                     let modified = if age < 60 {
                         "Modified just now".to_owned()
@@ -944,13 +1419,21 @@ impl Notes {
                     } else {
                         format!("Modified {} days ago", age / 86400)
                     };
+                    let icon = TablerIcon::named(
+                        if external { "file-text" } else { "notebook" },
+                        IconVariant::Outline,
+                    )
+                    .unwrap();
+                    cover.semantics.name = Some(note.0.title());
                     cover.children = vec![
-                        row(7000 + slot, vec![title, menu]).layout(Layout {
-                            flow: Flow::Row,
-                            height: Length::Px(34.0),
-                            gap: 4.0,
-                            ..Default::default()
-                        }),
+                        row(7000 + slot, vec![icon.element(92_000 + slot), title, menu]).layout(
+                            Layout {
+                                flow: Flow::Row,
+                                height: Length::Px(34.0),
+                                gap: 4.0,
+                                ..Default::default()
+                            },
+                        ),
                         preview,
                         label(60000 + slot, modified)
                             .class("document-date")
@@ -978,9 +1461,9 @@ impl Notes {
                     })
                     .children(vec![grid]),
             );
-            if self.results.is_empty() {
-                self.message = Some(
-                    if self.query.is_empty() {
+            if self.view.results.is_empty() {
+                self.view.message = Some(
+                    if self.view.query.is_empty() {
                         "No documents yet. Choose + to start writing."
                     } else {
                         "No matching documents."
@@ -988,14 +1471,15 @@ impl Notes {
                     .into(),
                 );
             }
-            if self.results.len() > PAGE_SIZE {
+            if self.view.results.len() > PAGE_SIZE {
                 body.push(row(
                     36,
                     vec![
-                        button(37, "Previous").enabled(self.overview_page > 0),
-                        label(38, format!("Page {}", self.overview_page + 1)),
-                        button(39, "Next")
-                            .enabled((self.overview_page + 1) * PAGE_SIZE < self.results.len()),
+                        button(37, "Previous").enabled(self.view.overview_page > 0),
+                        label(38, format!("Page {}", self.view.overview_page + 1)),
+                        button(39, "Next").enabled(
+                            (self.view.overview_page + 1) * PAGE_SIZE < self.view.results.len(),
+                        ),
                     ],
                 ));
             }
@@ -1072,66 +1556,116 @@ impl Notes {
             probe.visible = false;
             body.push(probe);
         }
+        if let Some(prompt) = &self.view.file_prompt {
+            let dialog = match prompt {
+                FilePrompt::Close(id) => file_dialog(
+                    format!(
+                        "Save changes before closing?\n{}",
+                        self.files[id].path.display()
+                    ),
+                    &[(102, "Save"), (103, "Discard"), (105, "Cancel")],
+                ),
+                FilePrompt::CloseWindow(ids) => {
+                    let mut paths = ids
+                        .iter()
+                        .take(3)
+                        .map(|id| self.files[id].path.display().to_string())
+                        .collect::<Vec<_>>();
+                    if ids.len() > 3 {
+                        paths.push(format!("And {} more", ids.len() - 3));
+                    }
+                    file_dialog(
+                        format!(
+                            "Save changes to {} files before closing?\n{}",
+                            ids.len(),
+                            paths.join("\n")
+                        ),
+                        &[(102, "Save All"), (103, "Discard All"), (105, "Cancel")],
+                    )
+                }
+                FilePrompt::Conflict(id) => file_dialog(
+                    format!(
+                        "The file changed, moved, or disappeared. Reload discards your edits. Overwrite writes your edits to the file.\n{}",
+                        self.files[id].path.display()
+                    ),
+                    &[
+                        (102, "Reload from Disk"),
+                        (103, "Overwrite"),
+                        (104, "Save As…"),
+                        (105, "Cancel"),
+                    ],
+                ),
+            };
+            body.push(dialog);
+        } else if let Some((_, snapshot)) = self.recoverable.front() {
+            let question = if self.recovery_after_crash {
+                "Notes closed unexpectedly. Recover unsaved edits?"
+            } else {
+                "Recover unsaved edits?"
+            };
+            body.push(file_dialog(
+                format!("{question}\n{}", snapshot.file.path.display()),
+                &[(106, "Recover"), (107, "Discard"), (108, "Later")],
+            ));
+        }
         let mut root = panel(0, body).layout(Layout {
             height: Length::Fill,
             gap: 0.0,
             ..Default::default()
         });
         root.paint_surface = true;
-        self.scene.replace(root)?;
-        self.scene.set_stylesheet(":root { color: var(--text); font-weight: 400; } menu-item { font-weight: 400; } .header { background-color: var(--surface-raised); border-bottom: 1px solid var(--border); } .status { background-color: var(--surface-raised); border-top: 1px solid var(--border); } .note-surface { color: var(--surface-raised); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .note-on-accent { color: var(--on-accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 400; } .document-cover:hover { background-color: var(--surface-selected); border-color: var(--accent); color: var(--accent); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 13px; line-height: 19px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--accent); } .document-cover:hover .document-title { color: var(--accent); } .document-date { color: var(--text-secondary); font-size: 11px; } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; font-weight: 400; } .document-menu { font-weight: 400; background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } .library-search { border: 1px solid var(--border-strong); background-color: var(--surface-raised); border-radius: 6px; } .sort-dropdown { text-align: left; } text-input { text-align: left; }")?;
-        if self.rename_note.is_some() {
-            self.scene.open_popup(ElementId(84))?;
-            self.scene.set_focus(Some(ElementId(86)))?;
+        self.view.scene.replace(root)?;
+        self.view.scene.set_stylesheet(":root { color: var(--text); font-weight: 400; } menu-item { font-weight: 400; } .header { background-color: var(--surface-raised); border-bottom: 1px solid var(--border); } .library-active { background-color: var(--surface-selected); color: var(--accent); border-bottom: 2px solid var(--accent); } .status { background-color: var(--surface-raised); border-top: 1px solid var(--border); } .note-surface { color: var(--surface-raised); } .note-selection { color: var(--surface-selected); } .note-accent { color: var(--accent); } .note-on-accent { color: var(--on-accent); } .status { color: var(--text-secondary); } .document-cover { background-color: var(--surface-raised); border: 1px solid var(--border); border-radius: 12px; color: var(--text-secondary); font-size: 15px; font-weight: 400; } .document-cover:hover { background-color: var(--surface-selected); border-color: var(--accent); color: var(--accent); } .document-preview { color: var(--text-secondary); font-family: monospace; font-size: 13px; line-height: 19px; font-weight: 400; } .document-cover:hover .document-preview { color: var(--accent); } .document-cover:hover .document-title { color: var(--accent); } .document-date { color: var(--text-secondary); font-size: 11px; } .document-cover:focus { outline: 2px solid var(--accent); } .document-title { font-size: 13px; line-height: 16px; font-weight: 400; } .document-menu { font-weight: 400; background-color: transparent; border-width: 0px; box-shadow: none; } .document-menu:hover { background-color: var(--surface-hover); } .library-search { border: 1px solid var(--border-strong); background-color: var(--surface-raised); border-radius: 6px; } .sort-dropdown { text-align: left; } text-input { text-align: left; }")?;
+        if self.view.file_prompt.is_some() || !self.recoverable.is_empty() {
+            self.view.scene.open_popup(ElementId(100))?;
+            self.view
+                .scene
+                .set_focus(Some(ElementId(if self.view.file_prompt.is_some() {
+                    105
+                } else {
+                    108
+                })))?;
         }
-        if self.pending_delete.is_some() {
-            self.scene.open_popup(ElementId(89))?;
-            self.scene.set_focus(Some(ElementId(92)))?;
+        if self.view.rename_note.is_some() {
+            self.view.scene.open_popup(ElementId(84))?;
+            self.view.scene.set_focus(Some(ElementId(86)))?;
+        }
+        if self.view.pending_delete.is_some() {
+            self.view.scene.open_popup(ElementId(89))?;
+            self.view.scene.set_focus(Some(ElementId(92)))?;
         }
         Ok(())
     }
     fn paint_tabs(&mut self, list: &mut DisplayList) {
-        let palette = paint::Palette::from_scene(&self.scene);
-        let Some(area) = self.scene.bounds(STRIP) else {
+        let palette = paint::Palette::from_scene(&self.view.scene);
+        let Some(area) = self.view.scene.bounds(STRIP) else {
             return;
         };
         paint::rect(list, area, palette.bg, area);
-        let width = (area.width / self.book.tabs.len().max(1) as f32).max(155.0);
-        let total = width * self.book.tabs.len() as f32;
-        if self.reveal_tab
-            && let Some(index) = self
-                .active
-                .as_ref()
-                .and_then(|id| self.book.tabs.iter().position(|t| t == id))
-        {
-            let x = index as f32 * width;
-            if x < self.tab_scroll {
-                self.tab_scroll = x;
-            }
-            if x + width > self.tab_scroll + area.width {
-                self.tab_scroll = x + width - area.width;
-            }
-            self.reveal_tab = false;
-        }
-        self.tab_scroll = self.tab_scroll.clamp(0.0, (total - area.width).max(0.0));
-        self.tab_hits.clear();
+        let width = self.tab_width(area.width);
+        self.view.tab_hits.clear();
         for (index, id) in self.book.tabs.iter().enumerate() {
             let r = Rect::new(
-                area.x + index as f32 * width - self.tab_scroll,
+                area.x + index as f32 * width - self.view.tab_scroll,
                 area.y,
                 width,
                 area.height,
             );
+            let file = self.files.get(id);
+            let base = DOCUMENT_TAB_BASE + index as u64 * 3;
             let close = Rect::new(r.x + r.width - 29.0, r.y + 6.0, 24.0, 26.0);
-            self.tab_hits.push(TabHit {
+            let bookmark =
+                file.map(|_| Rect::new(close.x - 24.0, close.y, close.width, close.height));
+            self.view.tab_hits.push(TabHit {
                 id: id.clone(),
                 rect: r,
                 close,
+                bookmark,
             });
             if r.x + r.width < area.x || r.x > area.x + area.width {
                 continue;
             }
-            let active = self.active.as_ref() == Some(id);
+            let active = self.view.page == Page::Editor && self.view.active.as_ref() == Some(id);
             paint::rect(
                 list,
                 r,
@@ -1156,14 +1690,14 @@ impl Notes {
                     area,
                 );
             }
-            let title = self
-                .book
-                .notes
-                .iter()
-                .find(|n| &n.id == id)
-                .map(Note::title)
-                .unwrap_or_default();
-            let count = ((width - 50.0) / 7.5).max(1.0) as usize;
+            let title = self.document_tab_title(id);
+            let title = if file.is_some_and(|file| file.dirty(&self.tabs[id].doc.text)) {
+                format!("• {title}")
+            } else {
+                title
+            };
+            let label_width = width - if file.is_some() { 87.0 } else { 63.0 };
+            let count = ((label_width - 9.0) / 7.5).max(1.0) as usize;
             let title = if title.chars().count() > count {
                 format!(
                     "{}…",
@@ -1187,66 +1721,210 @@ impl Notes {
             style.align = TextAlign::Center;
             paint::text(
                 list,
-                Rect::new(r.x + 8.0, r.y + 9.0, r.width - 43.0, 22.0),
+                Rect::new(r.x + 28.0, r.y + 9.0, label_width, 22.0),
                 title,
                 style,
                 area,
             );
-            paint::text(
+            paint_icon(
                 list,
-                Rect::new(close.x + 7.0, close.y + 3.0, 16.0, 20.0),
-                "×",
-                paint::style(15.0, false, palette.muted),
+                if file.is_some() {
+                    "file-text"
+                } else {
+                    "notebook"
+                },
+                IconVariant::Outline,
+                Rect::new(r.x + 8.0, r.y + 11.0, 16.0, 16.0),
+                palette.muted,
+                area,
+            );
+            let close_state = self.view.scene.interaction(ElementId(base + 1));
+            if close_state.is_some_and(|state| state.hovered || state.focused) {
+                paint::rect(list, close, palette.selected, area);
+            }
+            if self
+                .view
+                .scene
+                .interaction(ElementId(base))
+                .is_some_and(|state| state.focused)
+            {
+                paint::rect(
+                    list,
+                    Rect::new(r.x, r.y, r.width - 29.0, 2.0),
+                    palette.accent,
+                    area,
+                );
+            }
+            if let Some((file, bookmark)) = file.zip(bookmark) {
+                let bookmarked = self.bookmark_index(file).is_some();
+                if self
+                    .view
+                    .scene
+                    .interaction(ElementId(base + 2))
+                    .is_some_and(|state| state.hovered || state.focused)
+                {
+                    paint::rect(list, bookmark, palette.selected, area);
+                }
+                paint_icon(
+                    list,
+                    "bookmark",
+                    if bookmarked {
+                        IconVariant::Filled
+                    } else {
+                        IconVariant::Outline
+                    },
+                    Rect::new(bookmark.x + 4.0, bookmark.y + 5.0, 16.0, 16.0),
+                    palette.muted,
+                    area,
+                );
+            }
+            paint_icon(
+                list,
+                "x",
+                IconVariant::Outline,
+                Rect::new(close.x + 4.0, close.y + 5.0, 16.0, 16.0),
+                palette.muted,
                 area,
             );
         }
     }
 }
 impl Application for Notes {
+    fn shutdown(&mut self) -> AppResult {
+        if let Some(recovery) = &self.recovery {
+            recovery.end_session()?;
+        }
+        Ok(())
+    }
+
+    fn activate_window(&mut self, id: u64) -> AppResult {
+        self.switch_window(id)
+    }
+
+    fn open_window_files(&mut self, paths: &[PathBuf]) -> AppResult {
+        for path in paths {
+            self.open_cli_file(path)?;
+        }
+        Ok(())
+    }
+
+    fn window_removed(&mut self, id: u64) {
+        self.forget_window(id);
+    }
+
+    fn document_generation(&self) -> u64 {
+        self.generation
+    }
+
     fn modifiers_changed(&mut self, modifiers: ModifiersState) {
-        self.modifiers = modifiers;
+        self.view.modifiers = modifiers;
     }
     fn scene(&mut self) -> &mut Scene {
-        &mut self.scene
+        &mut self.view.scene
     }
     fn resize(&mut self, size: [f32; 2]) -> AppResult {
-        let changed = ((self.size[0] - 32.0) / 220.0).floor() != ((size[0] - 32.0) / 220.0).floor();
-        self.size = size;
-        if changed && self.page == Page::Overview {
+        let changed =
+            ((self.view.size[0] - 32.0) / 220.0).floor() != ((size[0] - 32.0) / 220.0).floor();
+        let width_changed = (self.view.size[0] - size[0]).abs() > 0.5 && !self.book.tabs.is_empty();
+        self.view.size = size;
+        if (changed && self.view.page == Page::Overview)
+            || (width_changed && self.view.page != Page::Settings)
+        {
             self.rebuild()?;
         }
         Ok(())
     }
     fn paint(&mut self, list: &mut DisplayList, measure: &mut dyn TextMeasurer) {
-        if self.page == Page::Editor {
+        if self.view.page != Page::Settings {
             self.paint_tabs(list);
-            if let Some(area) = self.scene.bounds(EDITOR)
-                && let Some(id) = self.active.clone()
-                && let Some(tab) = self.tabs.get_mut(&id)
-            {
-                let normal = tab.vim.as_ref().is_some_and(|v| !v.insert_mode());
-                self.metrics = paint::document(
-                    list,
-                    measure,
-                    &mut tab.doc,
-                    &self.settings,
-                    area,
-                    (self.focused, normal, &self.preedit),
-                    paint::Palette::from_scene(&self.scene),
-                );
-            }
+        }
+        if self.view.page == Page::Editor
+            && let Some(area) = self.view.scene.bounds(EDITOR)
+            && let Some(id) = self.view.active.clone()
+            && let Some(tab) = self.tabs.get_mut(&id)
+        {
+            let normal = tab.vim.as_ref().is_some_and(|v| !v.insert_mode());
+            self.view.metrics = paint::document(
+                list,
+                measure,
+                &mut tab.doc,
+                &self.settings,
+                area,
+                (self.view.focused, normal, &self.view.preedit),
+                paint::Palette::from_scene(&self.view.scene),
+            );
         }
     }
     fn effects(&mut self) -> Vec<Action> {
-        std::mem::take(&mut self.effects)
+        std::mem::take(&mut self.view.effects)
     }
     fn close_requested(&mut self) -> AppResult<bool> {
         self.save();
         self.refresh_status()?;
-        Ok(self.save_error.is_none())
+        if self.save_error.is_some() {
+            return Ok(false);
+        }
+        self.view.closing = true;
+        self.view.save_all = false;
+        self.close_progress()
     }
+
+    fn take_exit_request(&mut self) -> bool {
+        std::mem::take(&mut self.view.exit_requested)
+    }
+
+    fn next_checkpoint(&self) -> Option<Instant> {
+        self.checkpoints
+            .values()
+            .copied()
+            .chain(self.previews.deadline())
+            .min()
+    }
+
+    fn checkpoint(&mut self, now: Instant) -> AppResult {
+        if self
+            .previews
+            .deadline()
+            .is_some_and(|deadline| deadline <= now)
+            && self.previews.poll(now, &self.book.files)
+        {
+            self.generation = self.generation.wrapping_add(1);
+            if self.view.page == Page::Overview {
+                self.rebuild()?;
+            }
+        }
+        let Some(recovery) = &self.recovery else {
+            return Ok(());
+        };
+        let due: Vec<_> = self
+            .checkpoints
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            let file = &self.files[&id];
+            let text = &self.tabs[&id].doc.text;
+            let result = if file.dirty(text) {
+                recovery.checkpoint(&id, file, text)
+            } else {
+                recovery.clear(&id)
+            };
+            match result {
+                Ok(()) => {
+                    self.checkpoints.remove(&id);
+                }
+                Err(error) => {
+                    self.checkpoints.insert(id, now + Duration::from_secs(5));
+                    self.view.message = Some(format!("Recovery checkpoint failed: {error}"));
+                }
+            }
+        }
+        self.refresh_status()
+    }
+
     fn ime_state(&self) -> Option<TextInputState> {
-        if self.page != Page::Editor || !self.focused {
+        if self.view.page != Page::Editor || !self.view.focused {
             return None;
         }
         let tab = self.current()?;
@@ -1257,27 +1935,29 @@ impl Application for Notes {
             cursor: tab.doc.cursor,
             anchor: tab.doc.anchor,
             cursor_rectangle: self
+                .view
                 .metrics
                 .caret(&tab.doc, self.settings.tab_width as usize),
         })
     }
     fn clipboard_error(&mut self, error: &dyn std::error::Error) {
-        self.message = Some(format!("Clipboard: {error}"));
+        self.view.message = Some(format!("Clipboard: {error}"));
         let _ = self.refresh_status();
     }
     fn action(&mut self, action: Action) -> AppResult {
         match action {
             Action::Activated(id) => match id.0 {
-                2 if self.page == Page::Settings => self.leave_settings()?,
+                2 if self.view.page == Page::Settings => self.leave_settings()?,
                 2 => {
-                    let return_to_note = self.page == Page::Overview && self.active.is_some();
-                    self.page = if return_to_note {
+                    let return_to_note =
+                        self.view.page == Page::Overview && self.view.active.is_some();
+                    self.view.page = if return_to_note {
                         Page::Editor
                     } else {
                         Page::Overview
                     };
-                    self.focused = false;
-                    self.message = None;
+                    self.view.focused = false;
+                    self.view.message = None;
                     self.rebuild()?;
                     if return_to_note {
                         self.focus_editor()?;
@@ -1285,32 +1965,43 @@ impl Application for Notes {
                 }
                 4 => self.create()?,
                 5 => {
-                    if self.page != Page::Settings {
-                        self.settings_return = Some(self.page);
+                    if self.view.page != Page::Settings {
+                        self.view.settings_return = Some(self.view.page);
                     }
-                    self.page = Page::Settings;
-                    self.focused = false;
-                    self.message = None;
+                    self.view.page = Page::Settings;
+                    self.view.focused = false;
+                    self.view.message = None;
                     self.rebuild()?;
                 }
-                9 => self.import()?,
+                9 => self.pick_file()?,
+                12 => {
+                    self.save_current()?;
+                }
+                13 => self.import()?,
+                15 => {
+                    self.previews.start(&self.book.files);
+                    self.view.page = Page::Overview;
+                    self.view.focused = false;
+                    self.view.message = None;
+                    self.rebuild()?;
+                }
                 10 => self.export()?,
                 11 => {
-                    self.find_open = !self.find_open;
+                    self.view.find_open = !self.view.find_open;
                     self.rebuild()?;
-                    if self.find_open {
-                        self.focused = false;
-                        self.scene.set_focus(Some(FIND))?;
+                    if self.view.find_open {
+                        self.view.focused = false;
+                        self.view.scene.set_focus(Some(FIND))?;
                     } else {
                         self.focus_editor()?;
                     }
                 }
                 37 => {
-                    self.overview_page = self.overview_page.saturating_sub(1);
+                    self.view.overview_page = self.view.overview_page.saturating_sub(1);
                     self.rebuild()?;
                 }
                 39 => {
-                    self.overview_page += 1;
+                    self.view.overview_page += 1;
                     self.rebuild()?;
                 }
                 46 | 48 => {
@@ -1331,18 +2022,32 @@ impl Application for Notes {
                     self.save();
                     self.rebuild()?;
                 }
+                102..=104 => self.resolve_file_prompt(id.0)?,
+                105 => self.cancel_file_prompt()?,
+                106..=108 => {
+                    if let Some((snapshot_id, snapshot)) = self.recoverable.pop_front() {
+                        match id.0 {
+                            106 => self.recover_file(snapshot_id, snapshot)?,
+                            107 => {
+                                self.clear_recovery(&snapshot_id)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.rebuild()?;
+                }
                 91 => {
-                    if let Some(id) = self.pending_delete.take() {
+                    if let Some(id) = self.view.pending_delete.take() {
                         self.delete_note(&id)?;
                     }
                 }
                 92 => {
-                    self.pending_delete = None;
+                    self.view.pending_delete = None;
                     self.rebuild()?;
                 }
                 87 => self.finish_rename()?,
                 88 => {
-                    self.rename_note = None;
+                    self.view.rename_note = None;
                     self.rebuild()?;
                 }
                 61 => {
@@ -1352,13 +2057,13 @@ impl Application for Notes {
                 73 => self.find(true)?,
                 74 => self.find(false)?,
                 75 => {
-                    self.find_open = false;
+                    self.view.find_open = false;
                     self.rebuild()?;
                     self.focus_editor()?;
                 }
                 77 => {
-                    let query = self.find_query.clone();
-                    let replacement = self.replacement.clone();
+                    let query = self.view.find_query.clone();
+                    let replacement = self.view.replacement.clone();
                     if let Some(tab) = self.current_mut()
                         && tab.doc.selected() == query
                     {
@@ -1369,104 +2074,144 @@ impl Application for Notes {
                     self.find(false)?;
                 }
                 78 => {
-                    let query = self.find_query.clone();
-                    let replacement = self.replacement.clone();
+                    let query = self.view.find_query.clone();
+                    let replacement = self.view.replacement.clone();
                     let count = self
                         .current_mut()
                         .map_or(0, |tab| tab.doc.replace_all(&query, &replacement));
                     self.reset_vim_from_doc();
-                    self.message = Some(format!("Replaced {count} matches"));
+                    self.view.message = Some(format!("Replaced {count} matches"));
                     self.changed()?;
+                }
+                value if value >= DOCUMENT_TAB_BASE => {
+                    let offset = value - DOCUMENT_TAB_BASE;
+                    if let Some(tab) = self.book.tabs.get((offset / 3) as usize).cloned() {
+                        match offset % 3 {
+                            0 => self.open(tab)?,
+                            1 => self.close(&tab)?,
+                            _ => self.bookmark_file(&tab)?,
+                        }
+                    }
                 }
                 value if (1000..1000 + PAGE_SIZE as u64).contains(&value) => {
                     if let Some(id) = self
+                        .view
                         .results
-                        .get(self.overview_page * PAGE_SIZE + (value - 1000) as usize)
+                        .get(self.view.overview_page * PAGE_SIZE + (value - 1000) as usize)
                         .cloned()
                     {
-                        self.open(id)?;
+                        self.open_library_entry(id)?;
                     }
                 }
                 _ => {}
             },
+            Action::Selected(ElementId(16), 1) => self.import()?,
+            Action::Selected(ElementId(16), 2) => {
+                if let Some(id) = self
+                    .view
+                    .active
+                    .clone()
+                    .filter(|id| self.files.contains_key(id))
+                {
+                    self.save_file_as(&id)?;
+                } else {
+                    self.export()?;
+                }
+            }
             Action::Selected(ElementId(56), selected) => {
-                self.overview_sort = match selected {
+                self.view.overview_sort = match selected {
                     2 => OverviewSort::DateCreated,
                     3 => OverviewSort::TitleAscending,
                     _ => OverviewSort::DateModified,
                 };
-                self.overview_page = 0;
+                self.view.overview_page = 0;
                 self.rebuild()?;
             }
             Action::Selected(owner, operation)
                 if (2000..2000 + PAGE_SIZE as u64).contains(&owner.0) =>
             {
                 if let Some(id) = self
+                    .view
                     .results
-                    .get(self.overview_page * PAGE_SIZE + (owner.0 - 2000) as usize)
+                    .get(self.view.overview_page * PAGE_SIZE + (owner.0 - 2000) as usize)
                     .cloned()
                 {
                     match operation {
                         1 => {
-                            self.rename_text = self
+                            self.view.rename_text = self
                                 .book
                                 .notes
                                 .iter()
                                 .find(|n| n.id == id)
                                 .map(Note::title)
                                 .unwrap_or_default();
-                            self.pending_delete = None;
-                            self.rename_note = Some(id);
+                            self.view.pending_delete = None;
+                            self.view.rename_note = Some(id);
                             self.rebuild()?;
-                            self.scene.set_focus(Some(ElementId(86)))?;
+                            self.view.scene.set_focus(Some(ElementId(86)))?;
                         }
                         2 => self.export_note(&id)?,
-                        3 => {
-                            self.rename_note = None;
-                            self.pending_delete = Some(id);
+                        4 => {
+                            self.book.files.retain(|entry| entry.id != id);
+                            self.previews.start(&self.book.files);
+                            self.save();
                             self.rebuild()?;
-                            self.scene.set_focus(Some(ElementId(92)))?;
+                        }
+                        5 => self.locate_library_entry(&id)?,
+                        3 => {
+                            self.view.rename_note = None;
+                            self.view.pending_delete = Some(id);
+                            self.rebuild()?;
+                            self.view.scene.set_focus(Some(ElementId(92)))?;
                         }
                         _ => {}
                     }
                 }
             }
+            Action::PopupClosed(ElementId(100)) => {
+                if self.view.file_prompt.is_some() {
+                    self.cancel_file_prompt()?;
+                } else {
+                    self.recoverable.pop_front();
+                    self.rebuild()?;
+                }
+            }
             Action::PopupClosed(ElementId(84)) => {
-                self.rename_note = None;
+                self.view.rename_note = None;
                 self.rebuild()?;
             }
             Action::PopupClosed(ElementId(89)) => {
-                self.pending_delete = None;
+                self.view.pending_delete = None;
                 self.rebuild()?;
             }
-            Action::TextChanged(ElementId(86), text) => self.rename_text = text,
+            Action::TextChanged(ElementId(86), text) => self.view.rename_text = text,
             Action::Submitted(ElementId(86), _) => self.finish_rename()?,
             Action::TextChanged(SEARCH, text) => {
-                let edit = self.scene.widget(SEARCH).cloned();
-                self.query = text;
-                self.overview_page = 0;
-                self.message = None;
+                let edit = self.view.scene.widget(SEARCH).cloned();
+                self.view.query = text;
+                self.view.overview_page = 0;
+                self.view.message = None;
                 self.rebuild()?;
                 if let Some(edit) = edit {
-                    self.scene.set_widget(SEARCH, edit)?;
-                    self.scene.set_focus(Some(SEARCH))?;
+                    self.view.scene.set_widget(SEARCH, edit)?;
+                    self.view.scene.set_focus(Some(SEARCH))?;
                 }
             }
             Action::TextChanged(FIND, text) => {
-                self.find_query = text;
-                self.message = None;
+                self.view.find_query = text;
+                self.view.message = None;
                 self.refresh_status()?;
             }
             Action::TextChanged(REPLACE, text) => {
-                self.replacement = text;
+                self.view.replacement = text;
             }
             Action::Submitted(FIND, _) => {
-                self.find(self.search_backwards)?;
+                self.find(self.view.search_backwards)?;
                 if self.settings.vim {
                     self.focus_editor()?;
                 }
             }
-            Action::TextChanged(ElementId(80), text) => self.command = text,
+            Action::TextChanged(ElementId(80), text) => self.view.command = text,
             Action::Submitted(ElementId(80), _) => self.command()?,
             Action::Toggled(id, value) => {
                 match id.0 {
@@ -1506,82 +2251,104 @@ impl Application for Notes {
         Ok(())
     }
     fn input(&mut self, input: &Input) -> AppResult<bool> {
+        if self.view.file_prompt.is_some() || !self.recoverable.is_empty() {
+            return Ok(false);
+        }
         match input {
             Input::FocusLost => {
-                self.dragging = false;
-                self.scroll_drag = false;
-                self.horizontal_drag = false;
-                self.preedit.clear();
-                self.modifiers = ModifiersState::empty();
+                self.view.dragging = false;
+                self.view.scroll_drag = false;
+                self.view.horizontal_drag = false;
+                self.view.preedit.clear();
+                self.view.modifiers = ModifiersState::empty();
                 return Ok(false);
             }
             Input::Key { modifiers, .. } => {
-                self.modifiers = ModifiersState::empty();
+                self.view.modifiers = ModifiersState::empty();
                 if modifiers.shift {
-                    self.modifiers |= ModifiersState::SHIFT;
+                    self.view.modifiers |= ModifiersState::SHIFT;
                 }
                 if modifiers.control {
-                    self.modifiers |= ModifiersState::CONTROL;
+                    self.view.modifiers |= ModifiersState::CONTROL;
                 }
                 if modifiers.alt {
-                    self.modifiers |= ModifiersState::ALT;
+                    self.view.modifiers |= ModifiersState::ALT;
                 }
                 if modifiers.logo {
-                    self.modifiers |= ModifiersState::SUPER;
+                    self.view.modifiers |= ModifiersState::SUPER;
                 }
-                if self.page == Page::Editor && self.focused {
+                if self.view.page == Page::Editor && self.view.focused {
                     return Ok(true);
                 }
             }
             _ => {}
         }
-        if self.page != Page::Editor {
+        if let Input::Scroll { position, delta } = input
+            && self
+                .view
+                .scene
+                .bounds(STRIP)
+                .is_some_and(|area| paint::contains(area, *position))
+        {
+            self.view.tab_scroll += if delta[0] != 0.0 { delta[0] } else { delta[1] };
+            self.rebuild()?;
+            return Ok(true);
+        }
+        if let Input::PointerDown(point) = input
+            && let Some(area) = self.view.scene.bounds(STRIP)
+            && paint::contains(area, *point)
+        {
+            if let Some(hit) = self
+                .view
+                .tab_hits
+                .iter()
+                .find(|hit| paint::contains(hit.rect, *point))
+                .cloned()
+            {
+                if paint::contains(hit.close, *point) {
+                    self.close(&hit.id)?;
+                } else if hit
+                    .bookmark
+                    .is_some_and(|bookmark| paint::contains(bookmark, *point))
+                {
+                    self.bookmark_file(&hit.id)?;
+                } else {
+                    self.open(hit.id.clone())?;
+                    self.view.tab_drag = Some((hit.id, point[0]));
+                }
+            }
+            return Ok(true);
+        }
+        if self.view.page != Page::Editor {
             return Ok(false);
         }
         match input {
             Input::Preedit(text) => {
-                if self.focused {
-                    self.preedit = text.clone();
+                if self.view.focused {
+                    self.view.preedit = text.clone();
                     return Ok(true);
                 }
             }
             Input::PointerDown(p) => {
-                self.pointer = *p;
-                if let Some(area) = self.scene.bounds(STRIP)
-                    && paint::contains(area, *p)
-                {
-                    if let Some(hit) = self
-                        .tab_hits
-                        .iter()
-                        .find(|h| paint::contains(h.rect, *p))
-                        .cloned()
-                    {
-                        if paint::contains(hit.close, *p) {
-                            self.close(&hit.id)?;
-                        } else {
-                            self.open(hit.id.clone())?;
-                            self.tab_drag = Some((hit.id, p[0]));
-                        }
-                    }
-                    return Ok(true);
-                }
-                let area = self.scene.bounds(EDITOR).unwrap_or_default();
+                self.view.pointer = *p;
+                let area = self.view.scene.bounds(EDITOR).unwrap_or_default();
                 if !paint::contains(area, *p) {
-                    self.focused = false;
+                    self.view.focused = false;
                     return Ok(false);
                 }
                 self.focus_editor()?;
-                self.message = None;
-                self.preedit.clear();
+                self.view.message = None;
+                self.view.preedit.clear();
                 if !self.settings.word_wrap && p[1] > area.y + area.height - 10.0 {
-                    self.horizontal_drag = true;
+                    self.view.horizontal_drag = true;
                     return Ok(true);
                 }
                 if p[0] > area.x + area.width - 10.0 {
-                    self.scroll_drag = true;
+                    self.view.scroll_drag = true;
                     return Ok(true);
                 }
                 let clicks = self
+                    .view
                     .last_click
                     .filter(|(t, last, _)| {
                         t.elapsed().as_millis() < 400
@@ -1589,12 +2356,12 @@ impl Application for Notes {
                             && (last[1] - p[1]).abs() < 5.0
                     })
                     .map_or(1, |(_, _, count)| count % 3 + 1);
-                self.last_click = Some((Instant::now(), *p, clicks));
-                let metrics = self.metrics;
+                self.view.last_click = Some((Instant::now(), *p, clicks));
+                let metrics = self.view.metrics;
                 let width = self.settings.tab_width as usize;
-                let extend = self.modifiers.shift_key();
-                self.gutter_drag = p[0] < area.x + metrics.gutter;
-                let gutter = self.gutter_drag;
+                let extend = self.view.modifiers.shift_key();
+                self.view.gutter_drag = p[0] < area.x + metrics.gutter;
+                let gutter = self.view.gutter_drag;
                 if let Some(tab) = self.current_mut() {
                     let byte = metrics.hit(&tab.doc, *p, width);
                     if gutter || clicks == 3 {
@@ -1609,15 +2376,16 @@ impl Application for Notes {
                         let _ = vim.mouse_selection(&tab.doc.text, tab.doc.cursor, tab.doc.anchor);
                     }
                 }
-                self.dragging = true;
+                self.view.dragging = true;
                 self.refresh_status()?;
                 return Ok(true);
             }
             Input::PointerMove(p) => {
-                self.pointer = *p;
-                if let Some((id, start)) = self.tab_drag.clone() {
+                self.view.pointer = *p;
+                if let Some((id, start)) = self.view.tab_drag.clone() {
                     if (p[0] - start).abs() > 12.0
                         && let Some(target) = self
+                            .view
                             .tab_hits
                             .iter()
                             .position(|h| paint::contains(h.rect, *p))
@@ -1626,13 +2394,14 @@ impl Application for Notes {
                     {
                         let id = self.book.tabs.remove(from);
                         self.book.tabs.insert(target, id.clone());
-                        self.tab_drag = Some((id, p[0]));
+                        self.view.tab_drag = Some((id, p[0]));
                         self.save();
+                        self.rebuild()?;
                     }
                     return Ok(true);
                 }
-                if self.horizontal_drag {
-                    let metrics = self.metrics;
+                if self.view.horizontal_drag {
+                    let metrics = self.view.metrics;
                     let width = self.settings.tab_width as usize;
                     if let Some(tab) = self.current_mut() {
                         let longest = (tab.doc.scroll_row
@@ -1648,8 +2417,8 @@ impl Application for Notes {
                     }
                     return Ok(true);
                 }
-                if self.scroll_drag {
-                    let metrics = self.metrics;
+                if self.view.scroll_drag {
+                    let metrics = self.view.metrics;
                     let width = self.settings.tab_width as usize;
                     if let Some(tab) = self.current_mut() {
                         let fraction =
@@ -1662,10 +2431,10 @@ impl Application for Notes {
                     }
                     return Ok(true);
                 }
-                if self.dragging {
-                    let metrics = self.metrics;
+                if self.view.dragging {
+                    let metrics = self.view.metrics;
                     let width = self.settings.tab_width as usize;
-                    let gutter = self.gutter_drag;
+                    let gutter = self.view.gutter_drag;
                     if let Some(tab) = self.current_mut() {
                         if p[1] < metrics.area.y {
                             tab.doc.scroll_row = tab.doc.scroll_row.saturating_sub(1);
@@ -1692,32 +2461,27 @@ impl Application for Notes {
                 }
             }
             Input::PointerUp(_) => {
-                if self.dragging
-                    || self.scroll_drag
-                    || self.horizontal_drag
-                    || self.tab_drag.is_some()
+                if self.view.dragging
+                    || self.view.scroll_drag
+                    || self.view.horizontal_drag
+                    || self.view.tab_drag.is_some()
                 {
-                    self.dragging = false;
-                    self.scroll_drag = false;
-                    self.horizontal_drag = false;
-                    self.tab_drag = None;
+                    self.view.dragging = false;
+                    self.view.scroll_drag = false;
+                    self.view.horizontal_drag = false;
+                    self.view.tab_drag = None;
                     return Ok(true);
                 }
             }
             Input::Scroll { position, delta } => {
-                if let Some(area) = self.scene.bounds(STRIP)
-                    && paint::contains(area, *position)
-                {
-                    self.tab_scroll += if delta[0] != 0.0 { delta[0] } else { delta[1] };
-                    return Ok(true);
-                }
                 if self
+                    .view
                     .scene
                     .bounds(EDITOR)
                     .is_some_and(|r| paint::contains(r, *position))
                 {
-                    let metrics = self.metrics;
-                    let horizontal = self.modifiers.shift_key();
+                    let metrics = self.view.metrics;
+                    let horizontal = self.view.modifiers.shift_key();
                     let width = self.settings.tab_width as usize;
                     if let Some(tab) = self.current_mut() {
                         if (horizontal || delta[0] != 0.0) && !metrics.wrap {
@@ -1768,8 +2532,11 @@ impl Application for Notes {
         Ok(false)
     }
     fn key(&mut self, key: &NativeKey, modifiers: ModifiersState) -> AppResult<bool> {
-        self.modifiers = modifiers;
-        if self.page == Page::Settings && matches!(key, NativeKey::Named(NamedKey::Escape)) {
+        if self.view.file_prompt.is_some() || !self.recoverable.is_empty() {
+            return Ok(false);
+        }
+        self.view.modifiers = modifiers;
+        if self.view.page == Page::Settings && matches!(key, NativeKey::Named(NamedKey::Escape)) {
             self.leave_settings()?;
             return Ok(true);
         }
@@ -1778,40 +2545,53 @@ impl Application for Notes {
         if control {
             if let NativeKey::Character(c) = key {
                 match c.to_lowercase().as_str() {
-                    "n" => {
+                    "n" | "t" => {
                         self.create()?;
                         return Ok(true);
                     }
                     "o" => {
-                        self.import()?;
+                        self.pick_file()?;
                         return Ok(true);
                     }
                     "s" => {
+                        if shift && self.view.page != Page::Editor {
+                            return Ok(true);
+                        }
                         if shift {
-                            self.export()?;
+                            if let Some(id) = self
+                                .view
+                                .active
+                                .clone()
+                                .filter(|id| self.files.contains_key(id))
+                            {
+                                self.save_file_as(&id)?;
+                            } else {
+                                self.export()?;
+                            }
                         } else {
-                            self.save();
-                            self.refresh_status()?;
+                            self.save_current()?;
                         }
                         return Ok(true);
                     }
                     "w" => {
-                        if self.page == Page::Editor
-                            && let Some(id) = self.active.clone()
+                        if self.view.page == Page::Editor
+                            && let Some(id) = self.view.active.clone()
                         {
                             self.close(&id)?;
                         }
                         return Ok(true);
                     }
-                    "f" | "h" if self.page == Page::Editor => {
-                        self.find_open = true;
-                        self.focused = false;
+                    "f" | "h" if self.view.page == Page::Editor => {
+                        self.view.find_open = true;
+                        self.view.focused = false;
                         self.rebuild()?;
-                        self.scene.set_focus(Some(if c.eq_ignore_ascii_case("h") {
-                            REPLACE
-                        } else {
-                            FIND
-                        }))?;
+                        self.view
+                            .scene
+                            .set_focus(Some(if c.eq_ignore_ascii_case("h") {
+                                REPLACE
+                            } else {
+                                FIND
+                            }))?;
                         return Ok(true);
                     }
                     "+" | "=" | "-" | "0" => {
@@ -1841,37 +2621,37 @@ impl Application for Notes {
                 return Ok(true);
             }
         }
-        if self.page != Page::Editor {
+        if self.view.page != Page::Editor {
             return Ok(false);
         }
-        if matches!(key, NativeKey::Named(NamedKey::Escape)) && self.command_open {
-            self.command_open = false;
-            self.command.clear();
+        if matches!(key, NativeKey::Named(NamedKey::Escape)) && self.view.command_open {
+            self.view.command_open = false;
+            self.view.command.clear();
             self.rebuild()?;
             self.focus_editor()?;
             return Ok(true);
         }
-        if matches!(key, NativeKey::Named(NamedKey::Escape)) && self.find_open {
-            self.find_open = false;
+        if matches!(key, NativeKey::Named(NamedKey::Escape)) && self.view.find_open {
+            self.view.find_open = false;
             self.rebuild()?;
             self.focus_editor()?;
             return Ok(true);
         }
-        if !self.focused {
+        if !self.view.focused {
             return Ok(false);
         }
-        self.message = None;
+        self.view.message = None;
         let vim = self.settings.vim;
         if control && let NativeKey::Character(c) = key {
             let c = c.to_lowercase();
             let clipboard = !vim || shift;
             if clipboard && matches!(c.as_str(), "c" | "x" | "v") {
                 if c == "v" {
-                    self.effects.push(Action::RequestPaste(EDITOR));
+                    self.view.effects.push(Action::RequestPaste(EDITOR));
                 } else if let Some(tab) = self.current() {
                     let selected = tab.doc.selected().to_owned();
                     if !selected.is_empty() {
-                        self.effects.push(Action::Copy(selected));
+                        self.view.effects.push(Action::Copy(selected));
                         if c == "x" {
                             let settings = self.settings.clone();
                             self.current_mut()
@@ -1902,7 +2682,7 @@ impl Application for Notes {
             }
         }
         let settings = self.settings.clone();
-        let rows = self.metrics.rows as isize;
+        let rows = self.view.metrics.rows as isize;
         if vim
             && self
                 .current()
@@ -1913,22 +2693,22 @@ impl Application for Notes {
         {
             match c.as_str() {
                 "/" | "?" => {
-                    self.search_backwards = c == "?";
-                    self.find_open = true;
-                    self.focused = false;
+                    self.view.search_backwards = c == "?";
+                    self.view.find_open = true;
+                    self.view.focused = false;
                     self.rebuild()?;
-                    self.scene.set_focus(Some(FIND))?;
+                    self.view.scene.set_focus(Some(FIND))?;
                     return Ok(true);
                 }
                 "n" | "N" => {
-                    self.find(self.search_backwards ^ (c == "N"))?;
+                    self.find(self.view.search_backwards ^ (c == "N"))?;
                     return Ok(true);
                 }
                 ":" => {
-                    self.command_open = true;
-                    self.focused = false;
+                    self.view.command_open = true;
+                    self.view.focused = false;
                     self.rebuild()?;
-                    self.scene.set_focus(Some(ElementId(80)))?;
+                    self.view.scene.set_focus(Some(ElementId(80)))?;
                     return Ok(true);
                 }
                 _ => {}
@@ -2061,7 +2841,7 @@ impl Application for Notes {
             self.sync_vim(result)?;
             return Ok(true);
         }
-        let metrics = self.metrics;
+        let metrics = self.view.metrics;
         let doc = &mut self.current_mut().unwrap().doc;
         match key {
             NativeKey::Named(n) => match n {
@@ -2073,8 +2853,12 @@ impl Application for Notes {
                 NamedKey::ArrowRight => doc.horizontal(true, control, shift),
                 NamedKey::ArrowUp => metrics.vertical(doc, -1, shift, settings.tab_width as usize),
                 NamedKey::ArrowDown => metrics.vertical(doc, 1, shift, settings.tab_width as usize),
-                NamedKey::PageUp => metrics.vertical(doc, -rows, shift, settings.tab_width as usize),
-                NamedKey::PageDown => metrics.vertical(doc, rows, shift, settings.tab_width as usize),
+                NamedKey::PageUp => {
+                    metrics.vertical(doc, -rows, shift, settings.tab_width as usize)
+                }
+                NamedKey::PageDown => {
+                    metrics.vertical(doc, rows, shift, settings.tab_width as usize)
+                }
                 NamedKey::Home => doc.home(false, control, shift),
                 NamedKey::End => doc.home(true, control, shift),
                 NamedKey::Insert => doc.overwrite = !doc.overwrite,
@@ -2091,11 +2875,14 @@ impl Application for Notes {
         Ok(true)
     }
     fn text(&mut self, text: &str) -> AppResult<bool> {
-        if self.page != Page::Editor || !self.focused {
+        if self.view.file_prompt.is_some() || !self.recoverable.is_empty() {
             return Ok(false);
         }
-        self.preedit.clear();
-        self.message = None;
+        if self.view.page != Page::Editor || !self.view.focused {
+            return Ok(false);
+        }
+        self.view.preedit.clear();
+        self.view.message = None;
         let result = if self.settings.vim {
             self.current_mut()
                 .unwrap()

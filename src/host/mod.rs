@@ -1,3 +1,4 @@
+use crate::ipc;
 // Adapted from knave-app at 6d32ccc; see README.md and LICENSE in this directory.
 // Event-driven, single-window host for retained Knave UI scenes.
 //
@@ -67,6 +68,28 @@ pub trait Application {
     fn close_requested(&mut self) -> AppResult<bool> {
         Ok(true)
     }
+    fn shutdown(&mut self) -> AppResult {
+        Ok(())
+    }
+    fn activate_window(&mut self, _id: u64) -> AppResult {
+        Ok(())
+    }
+    fn open_window_files(&mut self, _paths: &[std::path::PathBuf]) -> AppResult {
+        Ok(())
+    }
+    fn window_removed(&mut self, _id: u64) {}
+    fn document_generation(&self) -> u64 {
+        0
+    }
+    fn next_checkpoint(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn checkpoint(&mut self, _now: std::time::Instant) -> AppResult {
+        Ok(())
+    }
+    fn take_exit_request(&mut self) -> bool {
+        false
+    }
     fn scene(&mut self) -> &mut Scene;
     /// Clipboard effects are handled before delivery; cut also reports the edited value.
     fn action(&mut self, action: Action) -> AppResult;
@@ -77,8 +100,13 @@ pub trait Application {
 }
 
 /// Run one window following the desktop theme preference.
-pub fn run(title: &str, size: [f64; 2], app: impl Application + 'static) -> AppResult {
-    run_inner(title, size, app, None, true)
+pub fn run(
+    title: &str,
+    size: [f64; 2],
+    app: impl Application + 'static,
+    server: ipc::Server,
+) -> AppResult {
+    run_inner(title, size, app, None, true, Some(server))
 }
 
 /// Run one window with a caller-supplied theme and optional live file updates.
@@ -93,13 +121,13 @@ pub fn run_with_theme_provider(
     app: impl Application + 'static,
     provider: Arc<dyn ThemeProvider>,
 ) -> AppResult {
-    run_inner(title, size, app, Some(provider), false)
+    run_inner(title, size, app, Some(provider), false, None)
 }
 
 /// Run without changing the application theme.
 #[allow(dead_code)]
 pub fn run_unthemed(title: &str, size: [f64; 2], app: impl Application + 'static) -> AppResult {
-    run_inner(title, size, app, None, false)
+    run_inner(title, size, app, None, false, None)
 }
 
 fn run_inner(
@@ -108,6 +136,7 @@ fn run_inner(
     mut app: impl Application + 'static,
     provider: Option<Arc<dyn ThemeProvider>>,
     follow_desktop: bool,
+    server: Option<ipc::Server>,
 ) -> AppResult {
     if size.iter().any(|v| !v.is_finite() || *v <= 0.0) {
         return Err("window dimensions must be finite and positive".into());
@@ -167,6 +196,13 @@ fn run_inner(
         let policy = app.scene().theme_policy();
         app.theme_policy_changed(policy)?;
     }
+    let incoming = server
+        .as_ref()
+        .map(|server| {
+            let proxy = event_loop.create_proxy();
+            server.receive(move || proxy.send_event(()).is_ok())
+        })
+        .transpose()?;
     let mut host = Host {
         #[cfg(target_os = "linux")]
         desktop_watcher,
@@ -178,6 +214,10 @@ fn run_inner(
         size,
         app,
         gpu: None,
+        incoming,
+        inactive: Default::default(),
+        window: 0,
+        next_window: 1,
         modifiers: ModifiersState::empty(),
         pointer: [0.0; 2],
         composing: false,
@@ -185,10 +225,13 @@ fn run_inner(
         error: None,
         epoch: std::time::Instant::now(),
     };
-    event_loop.run_app(&mut host)?;
+    let result = event_loop.run_app(&mut host);
+    // Remove the IPC endpoint while the application still holds the data lock.
+    drop(server);
+    result?;
     match host.error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => host.app.shutdown(),
     }
 }
 
@@ -363,11 +406,14 @@ impl Gpu {
         };
         let scale = self.window.scale_factor() as f32;
         let logical = size.to_logical::<f32>(scale as f64);
-        let mut list = app
-            .scene()
+        let scene = app.scene();
+        let mut list = scene
             .display_list([logical.width, logical.height], &mut self.painter)
             .clone();
+        let overlay_start = scene.overlay_start();
+        let overlay_len = list.commands.len() - overlay_start;
         app.paint(&mut list, &mut self.painter);
+        list.commands[overlay_start..].rotate_left(overlay_len);
         scale_list(&mut list, scale);
         let view = frame.texture.create_view(&Default::default());
         let text_view = if list.clear_color.alpha == u8::MAX && self.supports_surface_view_formats {
@@ -470,6 +516,15 @@ fn scale_list(list: &mut knave_ui::DisplayList, scale: f32) {
     }
 }
 
+struct WindowSlot {
+    token: u64,
+    gpu: Gpu,
+    modifiers: ModifiersState,
+    pointer: [f32; 2],
+    composing: bool,
+    app_dirty: bool,
+}
+
 struct Host<A> {
     #[cfg(target_os = "linux")]
     desktop_watcher: Option<theme::DesktopWatcher>,
@@ -482,6 +537,10 @@ struct Host<A> {
     size: [f64; 2],
     app: A,
     gpu: Option<Gpu>,
+    incoming: Option<std::sync::mpsc::Receiver<Vec<std::path::PathBuf>>>,
+    inactive: std::collections::HashMap<WindowId, WindowSlot>,
+    window: u64,
+    next_window: u64,
     modifiers: ModifiersState,
     pointer: [f32; 2],
     composing: bool,
@@ -489,6 +548,113 @@ struct Host<A> {
     error: Option<Box<dyn Error>>,
 }
 impl<A: Application> Host<A> {
+    fn park_window(&mut self) {
+        if let Some(gpu) = self.gpu.take() {
+            self.inactive.insert(
+                gpu.window.id(),
+                WindowSlot {
+                    token: self.window,
+                    gpu,
+                    modifiers: self.modifiers,
+                    pointer: self.pointer,
+                    composing: self.composing,
+                    app_dirty: self.app_dirty,
+                },
+            );
+        }
+    }
+
+    fn select_window(&mut self, id: WindowId) -> AppResult<bool> {
+        if self.gpu.as_ref().is_some_and(|gpu| gpu.window.id() == id) {
+            return Ok(true);
+        }
+        let Some(slot) = self.inactive.remove(&id) else {
+            return Ok(false);
+        };
+        self.park_window();
+        self.app.activate_window(slot.token)?;
+        self.window = slot.token;
+        self.gpu = Some(slot.gpu);
+        self.modifiers = slot.modifiers;
+        self.pointer = slot.pointer;
+        self.composing = slot.composing;
+        self.app_dirty = slot.app_dirty;
+        Ok(true)
+    }
+
+    fn remove_window(&mut self, event_loop: &ActiveEventLoop) -> AppResult {
+        let closed = self.window;
+        self.gpu = None;
+        if let Some(id) = self.inactive.keys().next().copied() {
+            self.select_window(id)?;
+            self.app.window_removed(closed);
+            self.app_dirty = true;
+            self.sync(true);
+        } else {
+            event_loop.exit();
+        }
+        Ok(())
+    }
+
+    fn create_window(&mut self, event_loop: &ActiveEventLoop) -> AppResult {
+        let window = Arc::new(
+            event_loop.create_window(
+                Window::default_attributes()
+                    .with_name("knave-notepad", "knave-notepad")
+                    .with_title(&self.title)
+                    .with_inner_size(LogicalSize::new(self.size[0], self.size[1]))
+                    .with_min_inner_size(LogicalSize::new(640.0, 480.0)),
+            )?,
+        );
+        let mut gpu = Gpu::new(window)?;
+        self.app.ready(&mut gpu.painter)?;
+        self.app
+            .resize([self.size[0] as f32, self.size[1] as f32])?;
+        gpu.window.request_redraw();
+        self.gpu = Some(gpu);
+        self.sync(true);
+        Ok(())
+    }
+
+    fn accept_windows(&mut self, event_loop: &ActiveEventLoop) -> AppResult {
+        while let Some(paths) = self
+            .incoming
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok())
+        {
+            self.park_window();
+            let id = self.next_window;
+            self.next_window += 1;
+            self.app.activate_window(id)?;
+            self.window = id;
+            self.modifiers = ModifiersState::empty();
+            self.composing = false;
+            self.pointer = [0.0; 2];
+            self.app_dirty = true;
+            self.app.open_window_files(&paths)?;
+            self.create_window(event_loop)?;
+        }
+        Ok(())
+    }
+
+    fn window_ids(&self) -> Vec<WindowId> {
+        self.gpu
+            .iter()
+            .map(|gpu| gpu.window.id())
+            .chain(self.inactive.keys().copied())
+            .collect()
+    }
+
+    fn request_window_redraws(&self) {
+        for gpu in self
+            .gpu
+            .iter()
+            .chain(self.inactive.values().map(|slot| &slot.gpu))
+        {
+            gpu.window.request_redraw();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn watcher_selection(
         &mut self,
@@ -632,12 +798,13 @@ impl<A: Application> Host<A> {
         match event {
             WindowEvent::CloseRequested => {
                 if self.app.close_requested()? {
-                    event_loop.exit();
+                    self.remove_window(event_loop)?;
                 } else {
+                    self.app_dirty = true;
                     self.sync(true);
                 }
             }
-            WindowEvent::Destroyed => event_loop.exit(),
+            WindowEvent::Destroyed => self.remove_window(event_loop)?,
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize();
@@ -768,8 +935,99 @@ impl<A: Application> Host<A> {
     }
 }
 impl<A: Application> ApplicationHandler for Host<A> {
-    #[cfg(target_os = "linux")]
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        if let Err(error) = self.accept_windows(event_loop) {
+            self.fail(event_loop, error);
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        for id in self.window_ids() {
+            if let Err(error) = self.select_window(id) {
+                self.fail(event_loop, error);
+                return;
+            }
+            self.refresh_window_theme(event_loop);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = std::time::Instant::now();
+        if self
+            .app
+            .next_checkpoint()
+            .is_some_and(|deadline| now >= deadline)
+        {
+            if let Err(error) = self.app.checkpoint(now) {
+                eprintln!("recovery: {error}");
+            }
+            self.app_dirty = true;
+        }
+        let mut deadline = self.app.next_checkpoint();
+        let generation = self.app.document_generation();
+        for id in self.window_ids() {
+            let result = (|| {
+                if !self.select_window(id)? {
+                    return Ok(());
+                }
+                for action in self.app.scene().advance(self.epoch.elapsed()) {
+                    self.app.action(action)?;
+                }
+                if self.app.take_exit_request() {
+                    self.remove_window(event_loop)?;
+                    return Ok(());
+                }
+                self.sync(true);
+                if let Some(wakeup) = self.app.scene().next_wakeup() {
+                    deadline = deadline.into_iter().chain(Some(now + wakeup)).min();
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.fail(event_loop, error);
+                return;
+            }
+        }
+        if generation != self.app.document_generation() {
+            self.request_window_redraws();
+        }
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.gpu.is_none()
+            && let Err(error) = self.create_window(event_loop)
+        {
+            self.fail(event_loop, error);
+        }
+    }
+
+    fn suspended(&mut self, _: &ActiveEventLoop) {
+        self.app.scene().event(Input::FocusLost);
+        self.gpu = None;
+        self.inactive.clear();
+        self.composing = false;
+        self.modifiers = ModifiersState::empty();
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        let generation = self.app.document_generation();
+        let result = (|| {
+            if self.select_window(id)? {
+                self.event(event_loop, event)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.fail(event_loop, error);
+        } else if generation != self.app.document_generation() {
+            self.request_window_redraws();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<A: Application> Host<A> {
+    fn refresh_window_theme(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(watcher) = &self.desktop_watcher {
             let scheme = *watcher.scheme.lock().unwrap();
             if let Some(scheme) = scheme {
@@ -819,67 +1077,6 @@ impl<A: Application> ApplicationHandler for Host<A> {
                 Err(error) => eprintln!("theme: {error}"),
             }
             self.sync(true);
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let actions = self.app.scene().advance(self.epoch.elapsed());
-        for action in actions {
-            if let Err(error) = self.app.action(action) {
-                self.fail(event_loop, error);
-                return;
-            }
-        }
-        self.sync(true);
-        event_loop.set_control_flow(
-            self.app
-                .scene()
-                .next_wakeup()
-                .map_or(ControlFlow::Wait, |delay| {
-                    ControlFlow::WaitUntil(std::time::Instant::now() + delay)
-                }),
-        );
-    }
-
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu.is_some() {
-            return;
-        }
-        let result = (|| {
-            let window = Arc::new(
-                event_loop.create_window(
-                    Window::default_attributes()
-                        .with_name("knave-notepad", "knave-notepad")
-                        .with_title(&self.title)
-                        .with_inner_size(LogicalSize::new(self.size[0], self.size[1]))
-                        .with_min_inner_size(LogicalSize::new(640.0, 480.0)),
-                )?,
-            );
-            let mut gpu = Gpu::new(window)?;
-            self.app.ready(&mut gpu.painter)?;
-            self.app
-                .resize([self.size[0] as f32, self.size[1] as f32])?;
-            gpu.window.request_redraw();
-            self.gpu = Some(gpu);
-            self.sync(true);
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.fail(event_loop, error);
-        }
-    }
-    fn suspended(&mut self, _: &ActiveEventLoop) {
-        self.app.scene().event(Input::FocusLost);
-        self.gpu = None;
-        self.composing = false;
-        self.modifiers = ModifiersState::empty();
-    }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        if self.gpu.as_ref().is_none_or(|g| g.window.id() != id) {
-            return;
-        }
-        if let Err(error) = self.event(event_loop, event) {
-            self.fail(event_loop, error);
         }
     }
 }

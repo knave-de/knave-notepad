@@ -23,6 +23,8 @@ fn overview_sort_dropdown_selects_stable_date_and_title_ordering() {
             text: "Beta".into(),
             updated: 2,
             created: 2,
+            keep_empty: false,
+            indexed_title: None,
             name: None,
         },
         Note {
@@ -30,6 +32,8 @@ fn overview_sort_dropdown_selects_stable_date_and_title_ordering() {
             text: "alpha".into(),
             updated: 2,
             created: 1,
+            keep_empty: false,
+            indexed_title: None,
             name: None,
         },
         Note {
@@ -37,32 +41,34 @@ fn overview_sort_dropdown_selects_stable_date_and_title_ordering() {
             text: "Gamma".into(),
             updated: 3,
             created: 3,
+            keep_empty: false,
+            indexed_title: None,
             name: None,
         },
     ];
     app.rebuild().unwrap();
     assert!(matches!(
-        app.scene.widget(ElementId(56)),
+        app.view.scene.widget(ElementId(56)),
         Some(Widget::Dropdown {
             selected: Some(1),
             ..
         })
     ));
-    assert_eq!(app.results, ["c", "a", "b"]);
+    assert_eq!(app.view.results, ["c", "a", "b"]);
 
     app.action(Action::Selected(ElementId(56), 3)).unwrap();
     assert!(matches!(
-        app.scene.widget(ElementId(56)),
+        app.view.scene.widget(ElementId(56)),
         Some(Widget::Dropdown {
             selected: Some(3),
             ..
         })
     ));
-    assert_eq!(app.results, ["a", "b", "c"]);
+    assert_eq!(app.view.results, ["a", "b", "c"]);
     app.action(Action::Selected(ElementId(56), 2)).unwrap();
-    assert_eq!(app.results, ["c", "b", "a"]);
+    assert_eq!(app.view.results, ["c", "b", "a"]);
     app.action(Action::Selected(ElementId(56), 1)).unwrap();
-    assert_eq!(app.results, ["c", "a", "b"]);
+    assert_eq!(app.view.results, ["c", "a", "b"]);
 }
 #[test]
 fn actual_editor_hooks_indentation_selection_undo_and_restart() {
@@ -100,7 +106,7 @@ fn actual_editor_hooks_indentation_selection_undo_and_restart() {
             .text
             .ends_with("replaced\n    next")
     );
-    let first = app.active.clone().unwrap();
+    let first = app.view.active.clone().unwrap();
     app.create().unwrap();
     app.text("second").unwrap();
     app.open(first.clone()).unwrap();
@@ -108,7 +114,7 @@ fn actual_editor_hooks_indentation_selection_undo_and_restart() {
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.action(Action::TextChanged(SEARCH, "replaced".into()))
         .unwrap();
-    assert_eq!(app.results, vec![first]);
+    assert_eq!(app.view.results, vec![first]);
     app.action(Action::Activated(ElementId(5))).unwrap();
     assert!(!app.settings.word_wrap);
     for id in [42, 44, 57, 63] {
@@ -153,11 +159,11 @@ fn tabs_close_without_deleting_and_cycle_restores_cursor() {
     let (_, mut app) = app();
     app.create().unwrap();
     app.text("first").unwrap();
-    let id = app.active.clone().unwrap();
+    let id = app.view.active.clone().unwrap();
     app.create().unwrap();
     app.text("second").unwrap();
     app.switch_tab(-1).unwrap();
-    assert_eq!(app.active.as_ref(), Some(&id));
+    assert_eq!(app.view.active.as_ref(), Some(&id));
     assert_eq!(app.current().unwrap().doc.cursor, 5);
     app.close(&id).unwrap();
     assert_eq!(app.book.notes.len(), 2);
@@ -167,7 +173,7 @@ fn tabs_close_without_deleting_and_cycle_restores_cursor() {
 fn save_failure_keeps_editor_and_blocks_close_until_retry() {
     let (dir, mut app) = app();
     app.create().unwrap();
-    let temp = dir.path().join("data/notebook.json.tmp");
+    let temp = dir.path().join("data/library.json.tmp");
     std::fs::create_dir(&temp).unwrap();
     app.text("still here").unwrap();
     assert!(!app.close_requested().unwrap());
@@ -183,10 +189,10 @@ fn find_replace_and_large_document_use_the_full_buffer() {
     let text = "line\n".repeat(10_000) + "needle";
     app.text(&text).unwrap();
     assert_eq!(app.current().unwrap().doc.lines(), 10_001);
-    app.find_query = "needle".into();
+    app.view.find_query = "needle".into();
     app.find(false).unwrap();
     assert_eq!(app.current().unwrap().doc.selected(), "needle");
-    app.replacement = "thread".into();
+    app.view.replacement = "thread".into();
     app.action(Action::Activated(ElementId(77))).unwrap();
     assert!(app.book.notes[0].text.ends_with("thread"));
 }
@@ -224,13 +230,14 @@ fn renderer_virtualizes_document_and_relative_gutter_tracks_cursor() {
     app.current_mut().unwrap().doc.scroll_row = 8;
     let mut measure = Measure;
     let mut list = app
+        .view
         .scene
         .display_list([1000.0, 720.0], &mut measure)
         .clone();
     let base = list.commands.len();
     app.paint(&mut list, &mut measure);
     assert!(list.commands.len() - base < 300);
-    assert!(app.metrics.area.height > 500.0);
+    assert!(app.view.metrics.area.height > 500.0);
     let numbers = list
         .commands
         .iter()
@@ -277,7 +284,7 @@ fn modal_command_bar_sets_persistent_editor_preferences() {
     app.create().unwrap();
     app.key(&NativeKey::Character(":".into()), ModifiersState::empty())
         .unwrap();
-    assert!(app.command_open);
+    assert!(app.view.command_open);
     app.action(Action::TextChanged(
         ElementId(80),
         "set rnu noexpandtab ts=8".into(),
@@ -288,8 +295,8 @@ fn modal_command_bar_sets_persistent_editor_preferences() {
     assert!(app.settings.relative_numbers);
     assert!(!app.settings.spaces);
     assert_eq!(app.settings.tab_width, 8);
-    assert!(app.focused);
-    assert!(!app.command_open);
+    assert!(app.view.focused);
+    assert!(!app.view.command_open);
 }
 #[test]
 fn mouse_selection_and_scrollbars_operate_on_the_editor_viewport() {
@@ -302,11 +309,12 @@ fn mouse_selection_and_scrollbars_operate_on_the_editor_viewport() {
     app.current_mut().unwrap().doc.scroll_col = 0;
     let mut measure = Measure;
     let mut list = app
+        .view
         .scene
         .display_list([1000.0, 720.0], &mut measure)
         .clone();
     app.paint(&mut list, &mut measure);
-    let m = app.metrics;
+    let m = app.view.metrics;
     let p = [m.area.x + m.gutter + 8.0, m.area.y + 8.0];
     app.input(&Input::PointerDown(p)).unwrap();
     app.input(&Input::PointerMove([p[0] + m.cell * 4.0, p[1]]))
@@ -315,7 +323,7 @@ fn mouse_selection_and_scrollbars_operate_on_the_editor_viewport() {
     assert_eq!(app.current().unwrap().doc.selected(), "xxxx");
     app.modifiers_changed(ModifiersState::SHIFT);
     app.modifiers_changed(ModifiersState::empty());
-    app.last_click = None; // A separate click, outside the double-click gesture.
+    app.view.last_click = None; // A separate click, outside the double-click gesture.
     app.input(&Input::PointerDown(p)).unwrap();
     app.input(&Input::PointerUp(p)).unwrap();
     assert!(app.current().unwrap().doc.selection().is_empty());
@@ -354,18 +362,29 @@ fn continuous_tab_strip_reorders_and_closes_with_pointer_input() {
     let first = app.book.tabs[0].clone();
     app.open(first.clone()).unwrap();
     let mut measure = Measure;
-    let mut list = app.scene.display_list([640.0, 480.0], &mut measure).clone();
+    let mut list = app
+        .view
+        .scene
+        .display_list([640.0, 480.0], &mut measure)
+        .clone();
     app.paint(&mut list, &mut measure);
-    assert_eq!(app.tab_hits.len(), 8);
-    let p = [app.tab_hits[0].rect.x + 40.0, app.tab_hits[0].rect.y + 15.0];
-    let target = [app.tab_hits[1].rect.x + 40.0, p[1]];
+    assert_eq!(app.view.tab_hits.len(), 8);
+    let p = [
+        app.view.tab_hits[0].rect.x + 40.0,
+        app.view.tab_hits[0].rect.y + 15.0,
+    ];
+    let target = [app.view.tab_hits[1].rect.x + 40.0, p[1]];
     app.input(&Input::PointerDown(p)).unwrap();
     app.input(&Input::PointerMove(target)).unwrap();
     app.input(&Input::PointerUp(target)).unwrap();
     assert_eq!(app.book.tabs[1], first);
-    let mut list = app.scene.display_list([640.0, 480.0], &mut measure).clone();
+    let mut list = app
+        .view
+        .scene
+        .display_list([640.0, 480.0], &mut measure)
+        .clone();
     app.paint(&mut list, &mut measure);
-    let close = app.tab_hits[1].close;
+    let close = app.view.tab_hits[1].close;
     app.input(&Input::PointerDown([close.x + 8.0, close.y + 8.0]))
         .unwrap();
     assert_eq!(app.book.tabs.len(), 7);
@@ -375,13 +394,14 @@ fn continuous_tab_strip_reorders_and_closes_with_pointer_input() {
 #[test]
 fn custom_surfaces_follow_theme_and_keep_user_colors_after_rebuild() {
     let (_dir, mut app) = app();
-    app.scene.set_theme(Theme::Light).unwrap();
-    let light = paint::Palette::from_scene(&app.scene);
-    app.scene.set_theme(Theme::Dark).unwrap();
-    let dark = paint::Palette::from_scene(&app.scene);
+    app.view.scene.set_theme(Theme::Light).unwrap();
+    let light = paint::Palette::from_scene(&app.view.scene);
+    app.view.scene.set_theme(Theme::Dark).unwrap();
+    let dark = paint::Palette::from_scene(&app.view.scene);
     assert_ne!(light.bg, dark.bg);
     assert_ne!(light.fg, dark.fg);
-    app.scene
+    app.view
+        .scene
         .set_theme_stylesheets(
             Theme::Light,
             "",
@@ -389,7 +409,7 @@ fn custom_surfaces_follow_theme_and_keep_user_colors_after_rebuild() {
         )
         .unwrap();
     app.create().unwrap();
-    let palette = paint::Palette::from_scene(&app.scene);
+    let palette = paint::Palette::from_scene(&app.view.scene);
     assert_eq!(palette.fg, knave_ui::Color::rgba(0x12, 0x34, 0x56, 255));
     assert_eq!(palette.accent, knave_ui::Color::rgba(0x65, 0x43, 0x21, 255));
     assert_eq!(
@@ -402,11 +422,11 @@ fn custom_surfaces_follow_theme_and_keep_user_colors_after_rebuild() {
 fn library_menu_renames_and_deletes_the_selected_note() {
     let (dir, mut app) = app();
     app.create().unwrap();
-    let first = app.active.clone().unwrap();
+    let first = app.view.active.clone().unwrap();
     app.text("Keep this text").unwrap();
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.action(Action::Selected(ElementId(2000), 1)).unwrap();
-    assert_eq!(app.rename_note.as_deref(), Some(first.as_str()));
+    assert_eq!(app.view.rename_note.as_deref(), Some(first.as_str()));
     app.action(Action::TextChanged(ElementId(86), "Renamed note".into()))
         .unwrap();
     app.action(Action::Activated(ElementId(87))).unwrap();
@@ -429,18 +449,19 @@ fn library_and_settings_rows_align_at_small_window_size() {
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.resize([640.0, 480.0]).unwrap();
     let mut measure = Measure;
-    app.scene.display_list([640.0, 480.0], &mut measure);
-    let search = app.scene.bounds(SEARCH).unwrap();
-    let label = app.scene.bounds(ElementId(33)).unwrap();
+    app.view.scene.display_list([640.0, 480.0], &mut measure);
+    let search = app.view.scene.bounds(SEARCH).unwrap();
+    let label = app.view.scene.bounds(ElementId(33)).unwrap();
     assert!((search.y + search.height / 2.0 - label.y - label.height / 2.0).abs() < 1.0);
-    let sort_label = app.scene.bounds(ElementId(54)).unwrap();
-    let sort_dropdown = app.scene.bounds(ElementId(56)).unwrap();
+    let sort_label = app.view.scene.bounds(ElementId(54)).unwrap();
+    let sort_dropdown = app.view.scene.bounds(ElementId(56)).unwrap();
     assert!((sort_dropdown.width - 180.0).abs() < 0.1);
     assert!((sort_dropdown.x - sort_label.x - sort_label.width - 6.0).abs() < 1.0);
     assert!(sort_dropdown.x + sort_dropdown.width <= 620.0);
     assert!(sort_label.x >= search.x + search.width);
     assert_eq!(
-        app.scene
+        app.view
+            .scene
             .computed_style(ElementId(56))
             .unwrap()
             .style
@@ -448,8 +469,9 @@ fn library_and_settings_rows_align_at_small_window_size() {
             .align,
         TextAlign::Start
     );
-    let normal = app.scene.computed_style(ElementId(1000)).unwrap();
+    let normal = app.view.scene.computed_style(ElementId(1000)).unwrap();
     let hover = app
+        .view
         .scene
         .computed_style_for(
             ElementId(1000),
@@ -461,10 +483,10 @@ fn library_and_settings_rows_align_at_small_window_size() {
         .unwrap();
     assert_ne!(normal.style.background, hover.style.background);
     app.action(Action::Activated(ElementId(5))).unwrap();
-    app.scene.display_list([640.0, 480.0], &mut measure);
-    let minus = app.scene.bounds(ElementId(46)).unwrap();
-    let plus = app.scene.bounds(ElementId(48)).unwrap();
-    let value = app.scene.bounds(ElementId(8041)).unwrap();
+    app.view.scene.display_list([640.0, 480.0], &mut measure);
+    let minus = app.view.scene.bounds(ElementId(46)).unwrap();
+    let plus = app.view.scene.bounds(ElementId(48)).unwrap();
+    let value = app.view.scene.bounds(ElementId(8041)).unwrap();
     assert_eq!(minus.y, plus.y);
     assert!((minus.y + minus.height / 2.0 - value.y - value.height / 2.0).abs() < 1.0);
     assert!(plus.x + plus.width <= 640.0);
@@ -474,19 +496,19 @@ fn library_and_settings_rows_align_at_small_window_size() {
 fn delete_menu_confirms_in_app_and_cancel_preserves_note() {
     let (_, mut app) = app();
     app.create().unwrap();
-    let id = app.active.clone().unwrap();
+    let id = app.view.active.clone().unwrap();
     app.text("hello").unwrap();
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.action(Action::Selected(ElementId(2000), 3)).unwrap();
-    assert_eq!(app.pending_delete.as_deref(), Some(id.as_str()));
+    assert_eq!(app.view.pending_delete.as_deref(), Some(id.as_str()));
     assert_eq!(app.book.notes.len(), 1);
-    assert!(app.scene.widget(ElementId(91)).is_some());
+    assert!(app.view.scene.widget(ElementId(91)).is_some());
     app.action(Action::Activated(ElementId(92))).unwrap();
-    assert!(app.pending_delete.is_none());
+    assert!(app.view.pending_delete.is_none());
     assert_eq!(app.book.notes.len(), 1);
     app.action(Action::Selected(ElementId(2000), 3)).unwrap();
     app.action(Action::Activated(ElementId(91))).unwrap();
-    assert!(app.pending_delete.is_none());
+    assert!(app.view.pending_delete.is_none());
     assert!(app.book.notes.is_empty());
     assert!(app.book.tabs.is_empty());
 }
@@ -514,18 +536,21 @@ fn library_toggle_returns_to_open_note_and_delete_uses_modal() {
     let (_, mut app) = app();
     app.create().unwrap();
     app.text("Keep this note").unwrap();
-    let active = app.active.clone();
+    let active = app.view.active.clone();
     app.action(Action::Activated(ElementId(2))).unwrap();
-    assert!(app.page == Page::Overview);
+    assert!(app.view.page == Page::Overview);
     app.action(Action::Activated(ElementId(2))).unwrap();
-    assert!(app.page == Page::Editor);
-    assert_eq!(app.active, active);
+    assert!(app.view.page == Page::Editor);
+    assert_eq!(app.view.active, active);
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.action(Action::Selected(ElementId(2000), 3)).unwrap();
-    assert!(app.pending_delete.is_some());
-    assert!(matches!(app.scene.widget(ElementId(89)), Some(Widget::Popup { modal: true })));
+    assert!(app.view.pending_delete.is_some());
+    assert!(matches!(
+        app.view.scene.widget(ElementId(89)),
+        Some(Widget::Popup { modal: true })
+    ));
     app.action(Action::PopupClosed(ElementId(89))).unwrap();
-    assert!(app.pending_delete.is_none());
+    assert!(app.view.pending_delete.is_none());
     assert_eq!(app.book.notes.len(), 1);
 }
 
@@ -536,15 +561,20 @@ fn rename_modal_cancels_without_changes_and_saves_name() {
     app.text("Original").unwrap();
     app.action(Action::Activated(ElementId(2))).unwrap();
     app.action(Action::Selected(ElementId(2000), 1)).unwrap();
-    assert!(matches!(app.scene.widget(ElementId(84)), Some(Widget::Popup { modal: true })));
-    app.action(Action::TextChanged(ElementId(86), "Discarded".into())).unwrap();
+    assert!(matches!(
+        app.view.scene.widget(ElementId(84)),
+        Some(Widget::Popup { modal: true })
+    ));
+    app.action(Action::TextChanged(ElementId(86), "Discarded".into()))
+        .unwrap();
     app.action(Action::PopupClosed(ElementId(84))).unwrap();
-    assert!(app.rename_note.is_none());
+    assert!(app.view.rename_note.is_none());
     assert_eq!(app.book.notes[0].title(), "Original");
     app.action(Action::Selected(ElementId(2000), 1)).unwrap();
-    app.action(Action::TextChanged(ElementId(86), "Renamed".into())).unwrap();
+    app.action(Action::TextChanged(ElementId(86), "Renamed".into()))
+        .unwrap();
     app.action(Action::Activated(ElementId(87))).unwrap();
-    assert!(app.rename_note.is_none());
+    assert!(app.view.rename_note.is_none());
     assert_eq!(app.book.notes[0].title(), "Renamed");
 }
 
@@ -554,16 +584,18 @@ fn settings_back_restores_editor_and_keeps_empty_draft_history() {
     app.create().unwrap();
     app.text("draft").unwrap();
     shortcut(&mut app, "z");
-    let active = app.active.clone();
+    let active = app.view.active.clone();
     assert!(app.current().unwrap().doc.text.is_empty());
     app.action(Action::Activated(ElementId(5))).unwrap();
     app.action(Action::Activated(ElementId(5))).unwrap();
-    assert_eq!(app.active, active);
-    assert!(matches!(app.scene.widget(ElementId(2)), Some(Widget::Button(label)) if label == "Back"));
+    assert_eq!(app.view.active, active);
+    assert!(
+        matches!(app.view.scene.widget(ElementId(2)), Some(Widget::Button(label)) if label == "Back")
+    );
     app.action(Action::Activated(ElementId(2))).unwrap();
-    assert!(app.page == Page::Editor);
-    assert!(app.focused);
-    assert_eq!(app.active, active);
+    assert!(app.view.page == Page::Editor);
+    assert!(app.view.focused);
+    assert_eq!(app.view.active, active);
     shortcut(&mut app, "y");
     assert_eq!(app.current().unwrap().doc.text, "draft");
     app.current_mut().unwrap().doc.cursor = 3;
@@ -573,7 +605,10 @@ fn settings_back_restores_editor_and_keeps_empty_draft_history() {
     app.action(Action::Activated(ElementId(5))).unwrap();
     key(&mut app, NamedKey::Escape, ModifiersState::empty());
     let doc = &app.current().unwrap().doc;
-    assert_eq!((doc.cursor, doc.anchor, doc.scroll_row, doc.scroll_col), (3, 1, 7, 2));
+    assert_eq!(
+        (doc.cursor, doc.anchor, doc.scroll_row, doc.scroll_col),
+        (3, 1, 7, 2)
+    );
 }
 
 #[test]
@@ -582,15 +617,16 @@ fn settings_back_returns_to_filtered_library_with_an_active_note() {
     app.create().unwrap();
     app.text("keep this note").unwrap();
     app.action(Action::Activated(ElementId(2))).unwrap();
-    app.action(Action::TextChanged(SEARCH, "keep".into())).unwrap();
-    app.overview_sort = OverviewSort::TitleAscending;
-    let results = app.results.clone();
+    app.action(Action::TextChanged(SEARCH, "keep".into()))
+        .unwrap();
+    app.view.overview_sort = OverviewSort::TitleAscending;
+    let results = app.view.results.clone();
     app.action(Action::Activated(ElementId(5))).unwrap();
     app.action(Action::Activated(ElementId(2))).unwrap();
-    assert!(app.page == Page::Overview);
-    assert_eq!(app.query, "keep");
-    assert!(app.overview_sort == OverviewSort::TitleAscending);
-    assert_eq!(app.results, results);
+    assert!(app.view.page == Page::Overview);
+    assert_eq!(app.view.query, "keep");
+    assert!(app.view.overview_sort == OverviewSort::TitleAscending);
+    assert_eq!(app.view.results, results);
 }
 
 #[test]
@@ -602,14 +638,174 @@ fn word_wrap_renders_long_line_as_multiple_rows_without_changing_text() {
     app.action(Action::Toggled(ElementId(63), true)).unwrap();
     app.current_mut().unwrap().doc.place(0, false);
     let mut measure = Measure;
-    let mut list = app.scene.display_list([400.0, 480.0], &mut measure).clone();
+    let mut list = app
+        .view
+        .scene
+        .display_list([400.0, 480.0], &mut measure)
+        .clone();
     app.paint(&mut list, &mut measure);
-    let rows: Vec<_> = list.commands.iter().filter_map(|command| match command {
-        knave_ui::DisplayCommand::Text { bounds, text, .. } if text.starts_with("hello ") => Some(bounds.y),
-        _ => None,
-    }).collect();
+    let rows: Vec<_> = list
+        .commands
+        .iter()
+        .filter_map(|command| match command {
+            knave_ui::DisplayCommand::Text { bounds, text, .. } if text.starts_with("hello ") => {
+                Some(bounds.y)
+            }
+            _ => None,
+        })
+        .collect();
     assert!(rows.len() > 1);
     assert!(rows.windows(2).all(|pair| pair[1] > pair[0]));
     assert_eq!(app.current().unwrap().doc.text, text);
     assert_eq!(app.current().unwrap().doc.scroll_col, 0);
+}
+
+#[test]
+fn filesystem_edits_save_explicitly_and_library_membership_is_metadata() {
+    let (dir, mut app) = app();
+    let path = dir.path().join("README.md");
+    std::fs::write(&path, b"first\r\nsecond").unwrap();
+    app.open_file(&path).unwrap();
+    assert_eq!(app.current().unwrap().doc.text, "first\nsecond");
+    assert!(app.book.notes.is_empty());
+    assert!(app.book.files.is_empty());
+
+    app.text("edited ").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), b"first\r\nsecond");
+    app.bookmark_file(&app.view.active.clone().unwrap())
+        .unwrap();
+    assert_eq!(app.storage.load().unwrap().0.files[0].path, path);
+    assert_eq!(std::fs::read(&path).unwrap(), b"first\r\nsecond");
+
+    assert!(app.save_current().unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited first\r\nsecond");
+    app.bookmark_file(&app.view.active.clone().unwrap())
+        .unwrap();
+    assert!(app.storage.load().unwrap().0.files.is_empty());
+    assert_eq!(std::fs::read(&path).unwrap(), b"edited first\r\nsecond");
+}
+
+#[test]
+fn linked_aliases_share_one_document_and_each_window_keeps_its_view() {
+    let (dir, mut app) = app();
+    let path = dir.path().join("source.txt");
+    let alias = dir.path().join("alias.txt");
+    std::fs::write(&path, "alpha\nbeta").unwrap();
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    app.open_file(&path).unwrap();
+    let first = app.view.active.clone().unwrap();
+    let doc = &mut app.current_mut().unwrap().doc;
+    doc.place(6, false);
+    doc.place(10, true);
+    doc.scroll_row = 1;
+
+    app.switch_window(1).unwrap();
+    app.open_file(&alias).unwrap();
+    assert_eq!(app.view.active.as_deref(), Some(first.as_str()));
+    assert_eq!(app.current().unwrap().doc.cursor, 0);
+    app.text("🙂\n").unwrap();
+    assert!(app.close_requested().unwrap());
+
+    app.switch_window(0).unwrap();
+    app.forget_window(1);
+    let doc = &app.current().unwrap().doc;
+    assert_eq!(doc.text, "🙂\nalpha\nbeta");
+    assert_eq!((doc.anchor, doc.cursor, doc.scroll_row), (11, 15, 2));
+    assert_eq!(app.files.len(), 1);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "alpha\nbeta");
+    app.close(&first).unwrap();
+    assert!(matches!(app.view.file_prompt, Some(FilePrompt::Close(_))));
+    app.action(Action::Activated(ElementId(103))).unwrap();
+    assert!(app.files.is_empty());
+}
+
+#[test]
+fn recovery_checkpoints_never_write_original_and_conflict_prompts_preserve_edits() {
+    let (dir, mut app) = app();
+    let path = dir.path().join("source");
+    let state = dir.path().join("state");
+    std::fs::write(&path, "original").unwrap();
+    app.set_recovery(Recovery::new(&state).unwrap()).unwrap();
+    app.open_file(&path).unwrap();
+    app.text("draft ").unwrap();
+    app.checkpoint(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    drop(app);
+
+    std::fs::write(&path, "disk changes").unwrap();
+    let storage = Storage::open(dir.path().join("data"), dir.path().join("config")).unwrap();
+    let mut app = Notes::new(storage).unwrap();
+    app.set_recovery(Recovery::new(&state).unwrap()).unwrap();
+    app.action(Action::Activated(ElementId(106))).unwrap();
+    assert_eq!(app.current().unwrap().doc.text, "draft original");
+    assert!(!app.save_current().unwrap());
+    assert!(matches!(
+        app.view.file_prompt,
+        Some(FilePrompt::Conflict(_))
+    ));
+    app.action(Action::Activated(ElementId(105))).unwrap();
+    assert_eq!(app.current().unwrap().doc.text, "draft original");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "disk changes");
+    assert_eq!(Recovery::new(&state).unwrap().pending().unwrap().len(), 1);
+
+    assert!(!app.save_current().unwrap());
+    app.action(Action::Activated(ElementId(103))).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "draft original");
+    assert!(Recovery::new(&state).unwrap().pending().unwrap().is_empty());
+}
+
+#[test]
+fn new_files_are_created_only_on_save_and_do_not_overwrite_a_racing_creator() {
+    let (dir, mut app) = app();
+    let path = dir.path().join("new-file");
+    app.open_file(&path).unwrap();
+    app.text("new content").unwrap();
+    assert!(!path.exists());
+    assert!(app.save_current().unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+
+    let race = dir.path().join("race");
+    app.open_file(&race).unwrap();
+    app.text("in memory").unwrap();
+    std::fs::write(&race, "on disk").unwrap();
+    assert!(!app.save_current().unwrap());
+    assert!(matches!(
+        app.view.file_prompt,
+        Some(FilePrompt::Conflict(_))
+    ));
+    assert_eq!(std::fs::read_to_string(&race).unwrap(), "on disk");
+}
+
+#[test]
+fn window_close_groups_dirty_files_and_explicit_discard_clears_checkpoints() {
+    let (dir, mut app) = app();
+    let state = dir.path().join("state");
+    app.set_recovery(Recovery::new(&state).unwrap()).unwrap();
+    for name in ["first.txt", "second.txt"] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "unchanged").unwrap();
+        app.open_file(&path).unwrap();
+        app.text("draft ").unwrap();
+    }
+    app.checkpoint(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(Recovery::new(&state).unwrap().pending().unwrap().len(), 2);
+    assert!(!app.close_requested().unwrap());
+    assert!(
+        matches!(app.view.file_prompt, Some(FilePrompt::CloseWindow(ref ids)) if ids.len() == 2)
+    );
+    app.action(Action::Activated(ElementId(105))).unwrap();
+    assert_eq!(app.files.len(), 2);
+    assert!(!app.take_exit_request());
+    assert!(!app.close_requested().unwrap());
+    app.action(Action::Activated(ElementId(103))).unwrap();
+    assert!(app.take_exit_request());
+    assert!(Recovery::new(&state).unwrap().pending().unwrap().is_empty());
+    for name in ["first.txt", "second.txt"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(name)).unwrap(),
+            "unchanged"
+        );
+    }
 }

@@ -138,6 +138,19 @@ impl Document {
     pub fn column(&self, width: usize) -> usize {
         columns(&self.text[self.start(self.row())..self.cursor], width)
     }
+    pub fn restore_view(
+        &mut self,
+        cursor: usize,
+        anchor: usize,
+        scroll_row: usize,
+        scroll_col: usize,
+    ) {
+        self.cursor = self.boundary(cursor);
+        self.anchor = self.boundary(anchor);
+        self.scroll_row = scroll_row;
+        self.scroll_col = scroll_col;
+    }
+
     pub fn place(&mut self, byte: usize, extend: bool) {
         self.cursor = self.boundary(byte);
         if !extend {
