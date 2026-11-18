@@ -7,8 +7,8 @@ description = "Notes — an autosaving, tabbed notebook for Knave"
 repository = "https://github.com/knave-de/knave-notepad"
 
 [dependencies]
-knave-ui = { git = "https://github.com/knave-de/knave-ui", rev = "a94a299e310acfa06f7756f4df55685147d56b37" }
-knave-renderer = { git = "https://github.com/knave-de/knave-ui", rev = "a94a299e310acfa06f7756f4df55685147d56b37" }
+knave-ui = { git = "https://github.com/knave-de/knave-ui", rev = "2730da664ab011b99e92d1c65f71c701d9ffff38" }
+knave-renderer = { git = "https://github.com/knave-de/knave-ui", rev = "2730da664ab011b99e92d1c65f71c701d9ffff38" }
 wgpu = "30.0.1"
 pollster = "1.0.1"
 winit = "0.30.13"
