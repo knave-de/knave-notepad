@@ -26,6 +26,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 png = "0.18"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+blake3 = "1.8.7"
 
 [dev-dependencies]
 tempfile = "3"
