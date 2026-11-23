@@ -5,9 +5,9 @@ use modalkit::{
     editing::{
         application::EmptyInfo,
         buffer::{CursorGroupId, EditBuffer},
-        context::EditContextBuilder,
+        context::{EditContextBuilder, Resolve},
         cursor::{Cursor, CursorGroup, CursorState},
-        store::Store,
+        store::{RegisterPutFlags, Store},
     },
     env::vim::{
         VimMode,
@@ -23,6 +23,7 @@ pub struct VimEditor {
     machine: VimMachine<TerminalKey>,
     buffer: EditBuffer<EmptyInfo>,
     group: CursorGroupId,
+    clipboard_copy: Option<String>,
     store: Rc<RefCell<Store<EmptyInfo>>>,
 }
 impl VimEditor {
@@ -38,6 +39,7 @@ impl VimEditor {
             machine: default_vim_keys(),
             buffer,
             group,
+            clipboard_copy: None,
             store,
         }
     }
@@ -119,11 +121,45 @@ impl VimEditor {
         while let Some((action, ctx)) = self.machine.pop() {
             match action {
                 Action::Editor(action) => {
-                    if let Err(e) = self.buffer.editor_command(
+                    let mut store = self.store.borrow_mut();
+                    let copy = matches!(
+                        &action,
+                        EditorAction::Edit(edit, _)
+                            if matches!(ctx.resolve(edit), EditAction::Yank(reg, _)
+                                if ctx.resolve(&reg).unwrap_or(Register::Unnamed)
+                                    == Register::Unnamed)
+                    );
+                    let previous_yank = copy.then(|| {
+                        // A missing motion or text object can succeed without writing a register.
+                        // Clear register 0 temporarily so repeated yanks still emit a copy.
+                        let previous = store.registers.get(&Register::LastYanked).unwrap();
+                        store
+                            .registers
+                            .put(
+                                &Register::LastYanked,
+                                Default::default(),
+                                RegisterPutFlags::NOTEXT,
+                            )
+                            .unwrap();
+                        previous
+                    });
+                    let result = self.buffer.editor_command(
                         &action,
                         &(self.group, &viewport, &ctx),
-                        &mut self.store.borrow_mut(),
-                    ) {
+                        &mut store,
+                    );
+                    if let Some(previous) = previous_yank {
+                        let yanked = store.registers.get(&Register::LastYanked).unwrap();
+                        if yanked.value.is_empty() {
+                            store
+                                .registers
+                                .put(&Register::LastYanked, previous, RegisterPutFlags::NOTEXT)
+                                .unwrap();
+                        } else if result.is_ok() {
+                            self.clipboard_copy = Some(yanked.value.to_string());
+                        }
+                    }
+                    if let Err(e) = result {
                         error = Some(e.to_string());
                     }
                 }
@@ -136,6 +172,9 @@ impl VimEditor {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+    pub fn take_clipboard_copy(&mut self) -> Option<String> {
+        self.clipboard_copy.take()
     }
     pub fn paste(&mut self, text: &str) -> Result<(), String> {
         if self.mode() != VimMode::Insert {

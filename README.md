@@ -91,8 +91,11 @@ and line motions, `gg`/`G`, operators such as `d`/`c`/`y`, `p`/`P`, `.`, and
 `u`/Ctrl+R. Registers are shared across open tabs. App indentation and newline
 policies participate in the same modal undo history.
 
-Use `i` to insert and Escape to return to Normal mode. Ctrl+Shift+C/X/V access
-the system clipboard. `/` and `?` open the app's literal search; Enter searches,
+Use `i` to insert and Escape to return to Normal mode. Yanks such as `yy`, `yw`,
+and Visual `y` copy to the system clipboard when using the unnamed register.
+Deletes, changes, and `p`/`P` use Vim's shared registers. Ctrl+Shift+C/X copy
+or cut the selection, and Ctrl+Shift+V pastes from the system clipboard in
+Insert mode. `/` and `?` open the app's literal search. Enter searches,
 then `n`/`N` repeat. The command bar supports `:w`, `:q`, `:wq`, `:x`, `:e <path>`,
 `:123` to jump to a line, and these `:set` options:
 

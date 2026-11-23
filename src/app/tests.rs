@@ -278,6 +278,53 @@ fn modal_registers_cross_tabs_and_dot_repeats_edits() {
     assert!(app.current().unwrap().doc.text.len() < before);
 }
 #[test]
+fn only_unnamed_vim_yanks_copy_to_the_desktop() {
+    let (_, mut app) = app();
+    app.settings.vim = true;
+    app.create().unwrap();
+    let keys = |app: &mut Notes, keys: &str| {
+        for c in keys.chars() {
+            assert!(
+                app.key(
+                    &NativeKey::Character(c.to_string().into()),
+                    ModifiersState::empty()
+                )
+                .unwrap()
+            );
+        }
+    };
+    keys(&mut app, "i");
+    app.text("first line").unwrap();
+    key(&mut app, NamedKey::Escape, ModifiersState::empty());
+
+    for (command, expected) in [
+        ("0yy", Some("first line\n")),
+        ("yy", Some("first line\n")),
+        ("yi(", None),
+        ("vlly", Some("fir")),
+        ("\"ayy", None),
+        ("\"_yy", None),
+        ("dw", None),
+        ("P", None),
+        ("cw", None),
+    ] {
+        keys(&mut app, command);
+        let effects = app.effects();
+        match expected {
+            Some(expected) => assert!(
+                matches!(
+                    effects.as_slice(),
+                    [Action::Copy(text)] if text == expected
+                ),
+                "{command}: {effects:?}"
+            ),
+            None => assert!(effects.is_empty(), "{command}: {effects:?}"),
+        }
+    }
+    assert_eq!(app.current().unwrap().doc.text, "first");
+}
+
+#[test]
 fn modal_command_bar_sets_persistent_editor_preferences() {
     let (_, mut app) = app();
     app.settings.vim = true;
