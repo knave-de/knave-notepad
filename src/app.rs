@@ -652,12 +652,17 @@ impl Notes {
     }
     fn sync_vim(&mut self, result: Result<(), String>) -> AppResult {
         self.view.message = result.err();
+        let mut clipboard_copy = None;
         if let Some(tab) = self.current_mut()
             && let Some(vim) = &mut tab.vim
         {
+            clipboard_copy = vim.take_clipboard_copy();
             let text = vim.text();
             let (cursor, anchor) = vim.positions();
             tab.doc.set_external(text, cursor, anchor);
+        }
+        if let Some(text) = clipboard_copy {
+            self.view.effects.push(Action::Copy(text));
         }
         self.changed()
     }
